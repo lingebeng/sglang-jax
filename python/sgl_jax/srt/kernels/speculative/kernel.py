@@ -90,12 +90,84 @@ def verify_tree_greedy(
     return accept_index, accept_token_num, predicts
 
 
-def top_k_renorm_prob(probs, top_k_values):
-    """Renormalizing probabilities by top-k thresholding.
+def top_k_top_p_renorm_prob(probs, top_k_values, top_p_values, max_k=1024):
+    """Fused top-k and top-p renormalization in a single pass.
+
+    This is more efficient than calling top_k_renorm_prob followed by top_p_renorm_prob
+    because it:
+    1. Only calls jax.lax.top_k once (instead of twice)
+    2. Only reconstructs the full distribution once (instead of twice)
+    3. Better cache locality by processing both filters together
+
+    Complexity: O(V + k log k) for the fused operation.
 
     Args:
       probs: probabilities, shape: (batch_size, num_classes).
-      top_k_values: the top-k threshold for re-normalizing probabilities, shape: (batch_size, 1).
+      top_k_values: the top-k threshold, shape: (batch_size,).
+      top_p_values: the top-p threshold, shape: (batch_size,).
+      max_k: maximum k value for static compilation (default: 1024).
+             Will be clamped to vocab_size if larger.
+
+    Returns:
+      Renormalized probabilities, shape ``(batch_size, num_classes)``.
+    """
+    assert len(probs.shape) == 2, f"length of probs.shape(): {len(probs.shape)} should equal to 2"
+    assert (
+        probs.shape[0] == top_k_values.shape[0]
+    ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
+    assert (
+        probs.shape[0] == top_p_values.shape[0]
+    ), f"probs.shape[0]: {probs.shape[0]} should equal to top_p_values.shape[0]: {top_p_values.shape}"
+
+    # Clamp max_k to vocab_size
+    vocab_size = probs.shape[1]
+    effective_max_k = min(max_k, vocab_size)
+
+    def process_single_sample(prob_row, k, p):
+        # Step 1: Extract top-k candidates (single top_k call)
+        top_k_probs, top_k_indices = jax.lax.top_k(prob_row, effective_max_k)
+
+        # Step 2: Apply top-k filter
+        mask_k = jnp.arange(effective_max_k) < k
+        filtered_probs = jnp.where(mask_k, top_k_probs, 0.0)
+
+        # Step 3: Apply top-p filter on the top-k filtered results
+        cumsum_probs = jnp.cumsum(filtered_probs)
+        total_prob = jnp.sum(filtered_probs)
+
+        # Find cutoff index for top-p
+        # When p >= 1.0, keep all top-k tokens
+        cutoff_idx = jnp.where(
+            p >= 1.0,
+            jnp.sum(mask_k) - 1,  # Keep all k tokens
+            jnp.argmax(cumsum_probs >= p * total_prob)
+        )
+
+        # Step 4: Combine both masks
+        mask_p = jnp.arange(effective_max_k) <= cutoff_idx
+        final_mask = mask_k & mask_p
+        selected_probs = jnp.where(final_mask, top_k_probs, 0.0)
+
+        # Step 5: Reconstruct full distribution (only once!)
+        result = jnp.zeros_like(prob_row)
+        result = result.at[top_k_indices].set(selected_probs)
+
+        return result / jnp.sum(result)
+
+    return jax.vmap(process_single_sample, in_axes=(0, 0, 0))(probs, top_k_values, top_p_values)
+
+
+def top_k_renorm_prob(probs, top_k_values, max_k=1024):
+    """Renormalizing probabilities by top-k thresholding.
+
+    Optimized implementation using jax.lax.top_k instead of full sorting.
+    Complexity: O(V + k log k) instead of O(V log V), where V is vocab_size.
+
+    Args:
+      probs: probabilities, shape: (batch_size, num_classes).
+      top_k_values: the top-k threshold for re-normalizing probabilities, shape: (batch_size,).
+      max_k: maximum k value for static compilation (default: 1024).
+             Will be clamped to vocab_size if larger.
 
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
@@ -105,22 +177,40 @@ def top_k_renorm_prob(probs, top_k_values):
         probs.shape[0] == top_k_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
 
-    # TODO: optimize alg of top_k by avoiding sort
+    # Clamp max_k to vocab_size
+    vocab_size = probs.shape[1]
+    effective_max_k = min(max_k, vocab_size)
+
     def process_single_sample(prob_row, k):
-        ranks = jnp.argsort(jnp.argsort(prob_row)[::-1])
-        mask = ranks < k
-        masked_probs = jnp.where(mask, prob_row, 0.0)
-        return masked_probs / jnp.sum(masked_probs)
+        # Use jax.lax.top_k for efficient partial sorting
+        # Note: effective_max_k must be static for JIT compilation
+        top_k_probs, top_k_indices = jax.lax.top_k(prob_row, effective_max_k)
+
+        # Dynamically mask based on actual k value
+        mask = jnp.arange(effective_max_k) < k
+        selected_probs = jnp.where(mask, top_k_probs, 0.0)
+
+        # Reconstruct full probability distribution
+        result = jnp.zeros_like(prob_row)
+        result = result.at[top_k_indices].set(selected_probs)
+
+        return result / jnp.sum(result)
 
     return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_k_values)
 
 
-def top_p_renorm_prob(probs, top_p_values):
+def top_p_renorm_prob(probs, top_p_values, max_top_k=1024):
     """Renormalizing probabilities by top-p thresholding.
+
+    Optimized implementation using jax.lax.top_k for pre-filtering before top-p.
+    Complexity: O(V + k log k) instead of O(V log V), where V is vocab_size.
 
     Args:
       probs: probabilities, shape: (batch_size, num_classes).
-      top_p_values: the top-p threshold for re-normalizing probabilities, shape: (batch_size, 1).
+      top_p_values: the top-p threshold for re-normalizing probabilities, shape: (batch_size,).
+      max_top_k: maximum number of top tokens to consider (default: 1024).
+                 Pre-filters to top max_top_k tokens before applying top-p.
+                 Will be clamped to vocab_size if larger.
 
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
@@ -130,20 +220,35 @@ def top_p_renorm_prob(probs, top_p_values):
         probs.shape[0] == top_p_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_p_values.shape}"
 
-    # TODO: optimize alg of top_p by avoiding sort
+    # Clamp max_top_k to vocab_size
+    vocab_size = probs.shape[1]
+    effective_max_k = min(max_top_k, vocab_size)
+
     def process_single_sample(prob_row, top_p):
-        sorted_indices = jnp.argsort(prob_row)[::-1]
-        sorted_probs = prob_row[sorted_indices]
+        # Step 1: Pre-filter using top_k (avoids full sorting)
+        top_k_probs, top_k_indices = jax.lax.top_k(prob_row, effective_max_k)
 
-        cumsum_probs = jnp.cumsum(sorted_probs)
-        cutoff_idx = jnp.argmax(cumsum_probs >= top_p)
+        # Step 2: Apply top-p on the filtered top_k results
+        cumsum_probs = jnp.cumsum(top_k_probs)
 
-        ranks = jnp.argsort(jnp.argsort(prob_row)[::-1])
+        # Find the cutoff index
+        # Special handling for top_p >= 1.0: keep all non-zero tokens
+        num_nonzero = jnp.sum(top_k_probs > 0)
+        cutoff_idx = jnp.where(
+            top_p >= 1.0,
+            num_nonzero - 1,  # Keep all non-zero tokens
+            jnp.argmax(cumsum_probs >= top_p)
+        )
 
-        mask = ranks <= cutoff_idx
+        # Step 3: Create mask for tokens within top-p threshold
+        mask_in_topk = jnp.arange(effective_max_k) <= cutoff_idx
+        selected_probs = jnp.where(mask_in_topk, top_k_probs, 0.0)
 
-        masked_probs = jnp.where(mask, prob_row, 0.0)
-        return masked_probs / jnp.sum(masked_probs)
+        # Step 4: Reconstruct full probability distribution
+        result = jnp.zeros_like(prob_row)
+        result = result.at[top_k_indices].set(selected_probs)
+
+        return result / jnp.sum(result)
 
     return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_p_values)
 

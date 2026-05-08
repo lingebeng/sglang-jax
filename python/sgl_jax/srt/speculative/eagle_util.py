@@ -27,6 +27,7 @@ from sgl_jax.srt.kernels.speculative.kernel import (
     create_extend_after_decode_spec_info,
     top_k_renorm_prob,
     top_p_renorm_prob,
+    top_k_top_p_renorm_prob,
     tree_speculative_sampling_target_only,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
@@ -833,6 +834,7 @@ class EagleVerifyInput:
                     retrive_next_sibling=self.retrive_next_sibling,
                     next_token_logits=logits_output.next_token_logits,
                 )
+        # 明确位置，此处是 non-greedy
         else:
             bs = self.retrive_index.shape[0]
             candidates = self.draft_token.reshape(bs, self.draft_token_num)
@@ -850,16 +852,14 @@ class EagleVerifyInput:
             target_probs = jax.nn.softmax(
                 logits_output.next_token_logits / expanded_temperature, axis=-1
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs, jnp.repeat(sampling_info.top_ks, self.draft_token_num)
+
+            # Apply fused top-k and top-p filtering (optimized single-pass implementation)
+            target_probs = top_k_top_p_renorm_prob(
+                target_probs,
+                jnp.repeat(sampling_info.top_ks, self.draft_token_num),
+                jnp.repeat(sampling_info.top_ps, self.draft_token_num),
             )
 
-            if not jnp.all(sampling_info.top_ps == 1.0):
-                target_probs = top_p_renorm_prob(
-                    target_probs, jnp.repeat(sampling_info.top_ps, self.draft_token_num)
-                )
-
-            # TODO: optimize top_k and top_p by avoiding sort
             rngs = jax.random.split(rng.params(), 3)
 
             draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
