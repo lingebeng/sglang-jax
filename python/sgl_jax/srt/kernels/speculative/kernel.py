@@ -254,10 +254,57 @@ def top_p_renorm_prob(probs, top_p_values, max_top_k=1024):
 
 
 def _sampling_from_prob(probs: jax.Array, threshold: jax.Array):
+    """Sample from probability distribution using cumulative distribution function.
+
+    This function implements robust sampling with fallback mechanism:
+    1. Filter valid probabilities (> 0)
+    2. Compute cumulative distribution function (CDF)
+    3. Find first index where CDF > threshold
+    4. If no valid sample found (threshold too large), use last valid index
+
+    Args:
+        probs: Probability distribution, shape: (vocab_size,)
+        threshold: Sampling threshold (u = coin * sum(probs)), scalar
+
+    Returns:
+        sampled_id: Sampled token index, scalar
+    """
+    vocab_size = probs.shape[0]
+
+    # Step 1: Filter valid probabilities (> 0)
     valid_probs = jnp.where(probs > 0, probs, 0)
+
+    # Step 2: Compute cumulative distribution function (CDF)
     cumsum_probs = jnp.cumsum(valid_probs)
-    selected_idx = jnp.argmax(cumsum_probs > threshold)
-    return selected_idx
+
+    # Step 3: Find first index where CDF > threshold
+    greater_than_threshold = cumsum_probs > threshold
+    selected_idx = jnp.argmax(greater_than_threshold)
+
+    # Step 4: Fallback mechanism for edge cases
+    # Case 1: threshold is too large (u very close to 1.0)
+    # Case 2: sum of probabilities < threshold due to floating point errors
+    # In these cases, argmax returns 0 even though no valid sample exists
+
+    # Check if we actually found a valid sample
+    found_valid_sample = greater_than_threshold[selected_idx]
+
+    # Find last valid index (last non-zero probability)
+    valid_mask = valid_probs > 0
+    valid_indices = jnp.where(valid_mask, jnp.arange(vocab_size), -1)
+    last_valid_id = jnp.max(valid_indices)
+
+    # Fallback logic:
+    # - If found valid sample: use selected_idx
+    # - If no valid sample and last_valid_id exists: use last_valid_id
+    # - If no valid indices at all: use vocab_size - 1 (extreme fallback)
+    sampled_id = jnp.where(
+        found_valid_sample,
+        selected_idx,
+        jnp.where(last_valid_id >= 0, last_valid_id, vocab_size - 1)
+    )
+
+    return sampled_id
 
 
 def tree_speculative_sampling_target_only(
@@ -313,7 +360,7 @@ def tree_speculative_sampling_target_only(
         num_accepted_tokens = 0
         accept_index = accept_index.at[bid, 0].set(last_accepted_retrive_idx)
 
-        for j in range(1, num_spec_step):
+        for _ in range(1, num_spec_step):
             cur_index = retrive_next_token[bid, cur_index]
             while cur_index != -1:
                 draft_index = retrive_index[bid, cur_index]
