@@ -157,6 +157,48 @@ def top_k_top_p_renorm_prob(probs, top_k_values, top_p_values, max_k=1024):
     return jax.vmap(process_single_sample, in_axes=(0, 0, 0))(probs, top_k_values, top_p_values)
 
 
+def top_k_top_p_renorm_prob_sharding_safe(probs, top_k_values, top_p_values):
+    """Sharding-safe version of top_k_top_p_renorm_prob.
+
+    Uses pure vectorized ops (argsort + cumsum + mask) instead of vmap + scatter,
+    which is incompatible with TP sharding on vocab dimension.
+
+    Args:
+      probs: probabilities, shape: (batch_size, vocab_size).
+      top_k_values: top-k threshold, shape: (batch_size,).
+      top_p_values: top-p threshold, shape: (batch_size,).
+
+    Returns:
+      Renormalized probabilities, shape: (batch_size, vocab_size).
+    """
+    # Sort descending
+    sorted_indices = jnp.argsort(-probs, axis=-1)
+    sorted_probs = jnp.take_along_axis(probs, sorted_indices, axis=-1)
+
+    # Top-k mask: keep only top-k tokens per row
+    rank = jnp.arange(probs.shape[-1])[None, :]
+    top_k_mask = rank < top_k_values[:, None].astype(jnp.int32)
+    sorted_probs = jnp.where(top_k_mask, sorted_probs, 0.0)
+
+    # Top-p mask: keep tokens until cumulative prob exceeds top_p
+    cumsum = jnp.cumsum(sorted_probs, axis=-1)
+    # Shift right so the token that crosses threshold is included
+    cumsum_shifted = jnp.concatenate([jnp.zeros_like(cumsum[:, :1]), cumsum[:, :-1]], axis=-1)
+    top_p_mask = cumsum_shifted < top_p_values[:, None]
+    # Always keep at least the top-1 token
+    top_p_mask = top_p_mask | (rank == 0)
+    sorted_probs = jnp.where(top_p_mask, sorted_probs, 0.0)
+
+    # Scatter back to original order
+    result = jnp.zeros_like(probs)
+    result = result.at[
+        jnp.arange(sorted_indices.shape[0])[:, None], sorted_indices
+    ].set(sorted_probs)
+
+    # Renormalize
+    return result / jnp.sum(result, axis=-1, keepdims=True)
+
+
 def top_k_renorm_prob(probs, top_k_values, max_k=1024):
     """Renormalizing probabilities by top-k thresholding.
 
@@ -406,7 +448,6 @@ def tree_speculative_sampling_target_only(
     return accept_index, accept_token_num, predicts
 
 
-@jax.jit
 def tree_speculative_sampling_target_only_jit(
     predicts: jax.Array,
     accept_index: jax.Array,
@@ -422,10 +463,11 @@ def tree_speculative_sampling_target_only_jit(
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,
 ):
-    """JIT-compiled version of tree_speculative_sampling_target_only.
+    """JIT-compiled non-greedy speculative rejection sampling.
 
-    Uses jax.lax control flow (fori_loop, while_loop, cond) instead of Python
-    control flow, enabling XLA compilation and automatic sharding support.
+    Uses jax.lax control flow (fori_loop/while_loop/cond) for XLA compilation.
+    Must be called via jax.jit() inside a mesh context for TP sharding support.
+
     Same args and returns as tree_speculative_sampling_target_only.
     """
     bs = candidates.shape[0]
