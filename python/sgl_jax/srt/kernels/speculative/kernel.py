@@ -406,6 +406,146 @@ def tree_speculative_sampling_target_only(
     return accept_index, accept_token_num, predicts
 
 
+@jax.jit
+def tree_speculative_sampling_target_only_jit(
+    predicts: jax.Array,
+    accept_index: jax.Array,
+    accept_token_num: jax.Array,
+    candidates: jax.Array,
+    retrive_index: jax.Array,
+    retrive_next_token: jax.Array,
+    retrive_next_sibling: jax.Array,
+    uniform_samples: jax.Array,
+    uniform_samples_for_final_sampling: jax.Array,
+    target_probs: jax.Array,
+    draft_probs: jax.Array,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+):
+    """JIT-compiled version of tree_speculative_sampling_target_only.
+
+    Uses jax.lax control flow (fori_loop, while_loop, cond) instead of Python
+    control flow, enabling XLA compilation and automatic sharding support.
+    Same args and returns as tree_speculative_sampling_target_only.
+    """
+    bs = candidates.shape[0]
+    num_spec_step = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+    vocab_size = target_probs.shape[1]
+    dtype = uniform_samples.dtype
+
+    def batch_loop(bid, state):
+        predicts_s, accept_index_s, accept_token_num_s, draft_probs_s = state
+
+        # Initialize this batch element
+        accept_index_s = accept_index_s.at[bid, 0].set(retrive_index[bid, 0])
+
+        cur_index_init = jnp.array(0, dtype=jnp.int32)
+        coin_init = uniform_samples[bid, 0]
+        last_accepted_init = retrive_index[bid, 0]
+        num_acc_init = jnp.array(0, dtype=jnp.int32)
+        prob_acc_init = jnp.array(0, dtype=dtype)
+        cur_prob_offset_init = bid * num_draft_tokens
+
+        # --- Step loop (fori_loop over speculation steps) ---
+        def step_body(step, step_state):
+            (cur_idx, last_acc, n_acc, stop_fori,
+             p_acc, coin, cp_off,
+             dp_s, pred_s, ai_s) = step_state
+
+            def verify(v_state):
+                (cur_idx, last_acc, n_acc, stop_fori,
+                 p_acc, coin, cp_off,
+                 dp_s, pred_s, ai_s) = v_state
+
+                cur_idx = retrive_next_token[bid, cur_idx]
+
+                # --- Sibling traversal (while_loop) ---
+                def while_cond(w):
+                    return (w[0] != -1) & (w[1] != 1)
+
+                def while_body(w):
+                    (ci, sw, la, na, pa, co, cpo, dp, pr, ai) = w
+                    d_idx = retrive_index[bid, ci]
+                    d_tok = candidates[bid, ci]
+                    tp_single = target_probs[cpo, d_tok]
+                    pa = pa + tp_single
+                    do_accept = (co <= pa / threshold_acc) | (tp_single >= threshold_single)
+
+                    def accept_fn(ops):
+                        ci_, sw_, la_, na_, pa_, co_, cpo_, d_idx_, d_tok_, dp_, pr_, ai_ = ops
+                        pr_ = pr_.at[la_].set(d_tok_)
+                        na_ = na_ + 1
+                        ai_ = ai_.at[bid, na_].set(d_idx_)
+                        return (ci_, jnp.int32(1), d_idx_, na_,
+                                jnp.array(0, dtype=dtype),
+                                uniform_samples[bid, ci_],
+                                bid * num_draft_tokens + ci_,
+                                d_idx_, d_tok_, dp_, pr_, ai_)
+
+                    def reject_fn(ops):
+                        ci_, sw_, la_, na_, pa_, co_, cpo_, d_idx_, d_tok_, dp_, pr_, ai_ = ops
+                        dp_ = dp_.at[cpo_, d_tok_].set(target_probs[cpo_, d_tok_])
+                        ci_ = retrive_next_sibling[bid, ci_]
+                        return (ci_, sw_, la_, na_, pa_, co_, cpo_,
+                                d_idx_, d_tok_, dp_, pr_, ai_)
+
+                    (ci, sw, la, na, pa, co, cpo,
+                     _, _, dp, pr, ai) = jax.lax.cond(
+                        do_accept, accept_fn, reject_fn,
+                        (ci, sw, la, na, pa, co, cpo, d_idx, d_tok, dp, pr, ai),
+                    )
+                    return (ci, sw, la, na, pa, co, cpo, dp, pr, ai)
+
+                (cur_idx, _, last_acc, n_acc, p_acc, coin, cp_off,
+                 dp_s, pred_s, ai_s) = jax.lax.while_loop(
+                    while_cond, while_body,
+                    (cur_idx, jnp.int32(0), last_acc, n_acc, p_acc, coin, cp_off,
+                     dp_s, pred_s, ai_s),
+                )
+                stop_fori = jax.lax.select(cur_idx == -1, 1, 0)
+                return (cur_idx, last_acc, n_acc, stop_fori,
+                        p_acc, coin, cp_off, dp_s, pred_s, ai_s)
+
+            return jax.lax.cond(
+                stop_fori != 1, verify, lambda x: x,
+                (cur_idx, last_acc, n_acc, stop_fori,
+                 p_acc, coin, cp_off, dp_s, pred_s, ai_s),
+            )
+
+        (_, last_acc_final, n_acc_final, _, _, _, cp_off_final,
+         draft_probs_s, predicts_s, accept_index_s) = jax.lax.fori_loop(
+            1, num_spec_step, step_body,
+            (cur_index_init, last_accepted_init, num_acc_init, jnp.int32(0),
+             prob_acc_init, coin_init, cur_prob_offset_init,
+             draft_probs_s, predicts_s, accept_index_s),
+        )
+
+        # --- Final sampling ---
+        final_coin = uniform_samples_for_final_sampling[bid]
+        q_vec = target_probs[cp_off_final, :]
+        p_vec = jax.lax.cond(
+            n_acc_final != num_spec_step - 1,
+            lambda _: draft_probs_s[cp_off_final, :],
+            lambda _: jnp.zeros((vocab_size,), dtype=dtype),
+            None,
+        )
+        relu_qp = jnp.maximum(q_vec - p_vec, jnp.array(0, dtype=dtype))
+        u = final_coin * jnp.sum(relu_qp)
+        sampled_id = _sampling_from_prob(relu_qp, u)
+        predicts_s = predicts_s.at[last_acc_final].set(sampled_id)
+        accept_token_num_s = accept_token_num_s.at[bid].set(n_acc_final)
+
+        return predicts_s, accept_index_s, accept_token_num_s, draft_probs_s
+
+    predicts, accept_index, accept_token_num, _ = jax.lax.fori_loop(
+        0, bs, batch_loop,
+        (predicts, accept_index, accept_token_num, draft_probs),
+    )
+
+    return accept_index, accept_token_num, predicts
+
+
 def align_evict_mask_to_page_size(
     seq_lens,
     evict_mask,

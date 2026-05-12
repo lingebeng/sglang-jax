@@ -29,6 +29,7 @@ from sgl_jax.srt.kernels.speculative.kernel import (
     top_p_renorm_prob,
     top_k_top_p_renorm_prob,
     tree_speculative_sampling_target_only,
+    tree_speculative_sampling_target_only_jit,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.managers.schedule_batch import (
@@ -889,7 +890,9 @@ class EagleVerifyInput:
                 coins = jax.random.uniform(rngs[1], candidates.shape, dtype=jnp.float32)
                 # coins for final sampling
                 coins_for_final_sampling = jax.random.uniform(rngs[2], (bs,), dtype=jnp.float32)
-                accept_index, accept_length, predict = tree_speculative_sampling_target_only(
+
+                # Use JIT-compiled version (XLA handles sharding automatically)
+                accept_index, accept_length, predict = tree_speculative_sampling_target_only_jit(
                     predicts=predict,
                     accept_index=accept_index,
                     accept_token_num=accept_length,
@@ -903,7 +906,6 @@ class EagleVerifyInput:
                     draft_probs=draft_probs,
                     threshold_single=global_server_args_dict["speculative_accept_threshold_single"],
                     threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
-                    deterministic=True,
                 )
         if SIMULATE_ACC_LEN:
             # Do simulation
