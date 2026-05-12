@@ -149,7 +149,7 @@ def top_k_top_p_renorm_prob(probs, top_k_values, top_p_values, max_k=1024):
         selected_probs = jnp.where(final_mask, top_k_probs, 0.0)
 
         # Step 5: Reconstruct full distribution (only once!)
-        result = jnp.zeros_like(prob_row)
+        result = jnp.zeros(prob_row.shape, dtype=prob_row.dtype)
         result = result.at[top_k_indices].set(selected_probs)
 
         return result / jnp.sum(result)
