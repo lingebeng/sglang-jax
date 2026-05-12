@@ -870,7 +870,7 @@ class TestDraftDecodeMask(CustomTestCase):
 
     def test_build_tree_pure_jax(self):
         """Test pure JAX implementation matches Pallas kernel output."""
-        from sgl_jax.srt.speculative.kernel import build_eagle_tree_structure_jax
+        from sgl_jax.srt.kernels.speculative.kernel import build_eagle_tree_structure_jax
 
         # Same test data as test_build_tree_kernel_efficient
         verified_id = jnp.array([29974, 13], dtype=jnp.int32)

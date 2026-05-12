@@ -326,7 +326,7 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
-    from sgl_jax.srt.speculative.kernel import build_eagle_tree_structure_jax
+    from sgl_jax.srt.kernels.speculative.kernel import build_eagle_tree_structure_jax
 
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
