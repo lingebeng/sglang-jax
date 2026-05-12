@@ -868,6 +868,210 @@ class TestDraftDecodeMask(CustomTestCase):
         print("Simple case test passed!")
 
 
+    def test_build_tree_pure_jax(self):
+        """Test pure JAX implementation matches Pallas kernel output."""
+        from sgl_jax.srt.speculative.kernel import build_eagle_tree_structure_jax
+
+        # Same test data as test_build_tree_kernel_efficient
+        verified_id = jnp.array([29974, 13], dtype=jnp.int32)
+
+        score_list_raw = [
+            jnp.array(
+                [
+                    [[7.1127e-01, 2.8292e-01, 2.2995e-03, 1.7357e-03]],
+                    [[9.7476e-01, 2.2219e-02, 6.5031e-04, 1.3212e-04]],
+                ],
+                dtype=jnp.float32,
+            ),
+            jnp.array(
+                [
+                    [
+                        [6.9142e-01, 1.2863e-02, 1.6873e-03, 1.1871e-03],
+                        [2.4787e-01, 1.8818e-02, 1.4204e-02, 9.2235e-04],
+                        [2.2971e-03, 1.6700e-06, 1.8737e-07, 8.3146e-08],
+                        [1.2771e-03, 2.4374e-04, 1.7832e-04, 1.1947e-05],
+                    ],
+                    [
+                        [8.4832e-02, 6.6068e-02, 5.8304e-02, 5.7851e-02],
+                        [2.3616e-03, 1.1243e-03, 5.4368e-04, 2.7768e-04],
+                        [2.5286e-04, 1.5578e-04, 2.8817e-05, 1.2888e-05],
+                        [1.2834e-04, 2.5417e-06, 1.1279e-06, 1.6088e-08],
+                    ],
+                ],
+                dtype=jnp.float32,
+            ),
+            jnp.array(
+                [
+                    [
+                        [6.6438e-01, 2.6997e-02, 2.4236e-05, 4.0821e-06],
+                        [2.4402e-01, 2.8409e-03, 5.0935e-04, 2.9022e-04],
+                        [1.6178e-02, 2.0567e-03, 4.5892e-04, 3.0034e-05],
+                        [1.3023e-02, 5.0497e-04, 3.6371e-04, 8.7750e-05],
+                    ],
+                    [
+                        [2.3263e-02, 2.0054e-02, 9.3990e-03, 2.7783e-03],
+                        [6.4156e-02, 5.5506e-04, 1.0429e-04, 9.7211e-05],
+                        [4.9950e-02, 5.0630e-03, 9.0068e-04, 3.3656e-04],
+                        [7.5817e-03, 8.5731e-04, 6.9972e-04, 6.0793e-04],
+                    ],
+                ],
+                dtype=jnp.float32,
+            ),
+            jnp.array(
+                [
+                    [
+                        [6.6420e-01, 1.0525e-04, 6.5864e-05, 1.2253e-06],
+                        [1.3019e-01, 1.0461e-01, 5.2083e-03, 1.6777e-03],
+                        [2.0103e-02, 6.7335e-03, 1.2625e-04, 1.0364e-05],
+                        [1.5142e-02, 7.0819e-04, 9.6595e-05, 8.7750e-05],
+                    ],
+                    [
+                        [5.8608e-02, 1.8840e-03, 7.8535e-04, 4.4400e-04],
+                        [1.2185e-02, 2.0684e-03, 1.7418e-03, 1.4327e-03],
+                        [6.2455e-03, 6.1487e-03, 2.6862e-03, 1.8034e-03],
+                        [1.8590e-03, 1.6151e-03, 1.2481e-03, 3.6038e-04],
+                    ],
+                ],
+                dtype=jnp.float32,
+            ),
+        ]
+
+        token_list_raw = [
+            jnp.array(
+                [[29896, 29906, 29900, 29945], [13, 2, 29871, 28956]],
+                dtype=jnp.int32,
+            ),
+            jnp.array(
+                [
+                    [29889, 29974, 29945, 29900, 29974, 29922, 29930, 29958,
+                     29889, 29974, 29946, 29953, 29941, 29892, 29896, 29945],
+                    [13, 2, 29871, 3001, 13, 2, 29871, 28956,
+                     22550, 4136, 16492, 8439, 29906, 29871, 2, 3001],
+                ],
+                dtype=jnp.int32,
+            ),
+            jnp.array(
+                [
+                    [29946, 29929, 29900, 29896, 29896, 29889, 29946, 29945,
+                     29889, 29974, 29906, 29929, 29974, 29922, 29889, 29930],
+                    [29871, 29941, 29906, 29896, 29906, 29871, 2, 3001,
+                     29871, 29906, 2, 29941, 29871, 29906, 29871, 2],
+                ],
+                dtype=jnp.int32,
+            ),
+            jnp.array(
+                [
+                    [29896, 29900, 29889, 29929, 29896, 29889, 29906, 29929,
+                     29929, 29946, 29900, 29896, 29974, 29922, 29889, 29930],
+                    [29941, 29906, 29896, 29945, 29896, 29906, 29946, 29929,
+                     29906, 29871, 2, 3001, 13, 2, 29871, 28956],
+                ],
+                dtype=jnp.int32,
+            ),
+        ]
+
+        parents_list_raw = [
+            jnp.array([[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]], dtype=jnp.int32),
+            jnp.array([[4, 8, 9, 10], [4, 5, 6, 7]], dtype=jnp.int32),
+            jnp.array([[20, 24, 21, 28], [24, 28, 20, 21]], dtype=jnp.int32),
+            jnp.array([[36, 40, 41, 44], [36, 40, 44, 45]], dtype=jnp.int32),
+        ]
+
+        seq_lens = jnp.array([5, 10], dtype=jnp.int32)
+        topk = 4
+        num_draft_token = 8
+
+        score_list = jnp.concatenate(score_list_raw, axis=1)
+        token_list = jnp.concatenate(token_list_raw, axis=1)
+        parents_list = jnp.concatenate(parents_list_raw, axis=1)
+
+        # Step 1: Run preprocess to get intermediate data
+        parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
+            verified_id, score_list, token_list, parents_list,
+            num_verify_tokens=num_draft_token,
+            batch_size=2,
+            speculative_num_steps=4,
+        )
+
+        # Step 2: Run pure JAX implementation
+        tree_mask_jax, position_jax, retrive_index_jax, retrive_next_token_jax, retrive_next_sibling_jax = (
+            build_eagle_tree_structure_jax(
+                parent_list=parent_list,
+                selected_index=top_scores_index,
+                verified_seq_len=seq_lens,
+                draft_token_num=num_draft_token,
+                topk=topk,
+                seq_lens_sum=int(jnp.sum(seq_lens)),
+                max_context_len=int(seq_lens.max()),
+                tree_mask_mode=0,
+            )
+        )
+
+        # Step 3: Compare with expected values
+        expected_position = [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
+        expected_retrive_index = [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [8, 9, 10, 11, 12, 13, 14, 15],
+        ]
+        expected_retrive_next_token = [
+            [1, 3, 4, 5, 6, 7, -1, -1],
+            [1, 2, -1, 6, -1, -1, 7, -1],
+        ]
+        expected_retrive_next_sibling = [
+            [-1, 2, -1, -1, -1, -1, -1, -1],
+            [-1, -1, 3, 4, 5, -1, -1, -1],
+        ]
+
+        expected_tree_mask = [
+            # first seq (seq_len=5, draft_token_num=8, row_len=13)
+            True, True, True, True, True, True, False, False, False, False, False, False, False,
+            True, True, True, True, True, True, True, False, False, False, False, False, False,
+            True, True, True, True, True, True, False, True, False, False, False, False, False,
+            True, True, True, True, True, True, True, False, True, False, False, False, False,
+            True, True, True, True, True, True, False, True, False, True, False, False, False,
+            True, True, True, True, True, True, True, False, True, False, True, False, False,
+            True, True, True, True, True, True, False, True, False, True, False, True, False,
+            True, True, True, True, True, True, True, False, True, False, True, False, True,
+            # second seq (seq_len=10, draft_token_num=8, row_len=18)
+            True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, False, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, False, False, True, False, False, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, True, False, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, True, False,
+            True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, True, False,
+        ]
+
+        print("\n=== Testing Pure JAX Implementation ===")
+
+        actual_position = position_jax.tolist()
+        print(f"Expected position: {expected_position}")
+        print(f"Actual position:   {actual_position}")
+        self.assertEqual(actual_position, expected_position, "Position mismatch")
+        print("  Position matches!")
+
+        actual_retrive_index = retrive_index_jax.tolist()
+        self.assertEqual(actual_retrive_index, expected_retrive_index, "Retrive_index mismatch")
+        print("  Retrive_index matches!")
+
+        actual_retrive_next_token = retrive_next_token_jax.tolist()
+        self.assertEqual(actual_retrive_next_token, expected_retrive_next_token, "Retrive_next_token mismatch")
+        print("  Retrive_next_token matches!")
+
+        actual_retrive_next_sibling = retrive_next_sibling_jax.tolist()
+        self.assertEqual(actual_retrive_next_sibling, expected_retrive_next_sibling, "Retrive_next_sibling mismatch")
+        print("  Retrive_next_sibling matches!")
+
+        tree_mask_list = [bool(x) for x in tree_mask_jax.tolist()]
+        if len(tree_mask_list) > len(expected_tree_mask):
+            tree_mask_list = tree_mask_list[:len(expected_tree_mask)]
+        self.assertEqual(tree_mask_list, expected_tree_mask, "Tree mask mismatch")
+        print("  Tree mask matches!")
+
+        print("Pure JAX implementation test passed!")
+
+
 if __name__ == "__main__":
     import unittest
 
