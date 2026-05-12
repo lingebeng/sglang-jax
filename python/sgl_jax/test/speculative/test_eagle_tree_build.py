@@ -870,7 +870,7 @@ class TestDraftDecodeMask(CustomTestCase):
 
     def test_build_tree_pure_jax(self):
         """Test pure JAX implementation matches Pallas kernel output."""
-        from sgl_jax.srt.kernels.speculative.kernel import build_eagle_tree_structure_jax
+        from sgl_jax.srt.kernels.speculative.kernel import build_eagle_tree_structure
 
         # Same test data as test_build_tree_kernel_efficient
         verified_id = jnp.array([29974, 13], dtype=jnp.int32)
@@ -993,9 +993,46 @@ class TestDraftDecodeMask(CustomTestCase):
             speculative_num_steps=4,
         )
 
-        # Step 2: Run pure JAX implementation
+        # Step 2: Run Pallas kernel as reference
+        from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+            build_eagle_tree_structure as pallas_build,
+        )
+        import jax
+        mesh = jax.sharding.Mesh(jax.devices(), ("data",))
+        try:
+            ctx = jax.sharding.use_mesh(mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(mesh)
+            except AttributeError:
+                ctx = mesh
+        with ctx:
+            tree_mask_ref, position_ref, retrive_index_ref, retrive_next_token_ref, retrive_next_sibling_ref = (
+                pallas_build(
+                    parent_list=parent_list,
+                    selected_index=top_scores_index,
+                    verified_seq_len=seq_lens,
+                    draft_token_num=num_draft_token,
+                    topk=topk,
+                    seq_lens_sum=int(jnp.sum(seq_lens)),
+                    max_context_len=int(seq_lens.max()),
+                    tree_mask_mode=0,
+                )
+            )
+            tree_mask_ref_q, _, _, _, _ = pallas_build(
+                parent_list=parent_list,
+                selected_index=top_scores_index,
+                verified_seq_len=seq_lens,
+                draft_token_num=num_draft_token,
+                topk=topk,
+                seq_lens_sum=int(jnp.sum(seq_lens)),
+                max_context_len=int(seq_lens.max()),
+                tree_mask_mode=1,
+            )
+
+        # Step 3: Run pure JAX implementation
         tree_mask_jax, position_jax, retrive_index_jax, retrive_next_token_jax, retrive_next_sibling_jax = (
-            build_eagle_tree_structure_jax(
+            build_eagle_tree_structure(
                 parent_list=parent_list,
                 selected_index=top_scores_index,
                 verified_seq_len=seq_lens,
@@ -1007,69 +1044,50 @@ class TestDraftDecodeMask(CustomTestCase):
             )
         )
 
-        # Step 3: Compare with expected values
-        expected_position = [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
-        expected_retrive_index = [
-            [0, 1, 2, 3, 4, 5, 6, 7],
-            [8, 9, 10, 11, 12, 13, 14, 15],
-        ]
-        expected_retrive_next_token = [
-            [1, 3, 4, 5, 6, 7, -1, -1],
-            [1, 2, -1, 6, -1, -1, 7, -1],
-        ]
-        expected_retrive_next_sibling = [
-            [-1, 2, -1, -1, -1, -1, -1, -1],
-            [-1, -1, 3, 4, 5, -1, -1, -1],
-        ]
+        # Step 4: Compare pure JAX vs Pallas
+        import numpy as np
+        print("\n=== Testing Pure JAX vs Pallas ===")
 
-        expected_tree_mask = [
-            # first seq (seq_len=5, draft_token_num=8, row_len=13)
-            True, True, True, True, True, True, False, False, False, False, False, False, False,
-            True, True, True, True, True, True, True, False, False, False, False, False, False,
-            True, True, True, True, True, True, False, True, False, False, False, False, False,
-            True, True, True, True, True, True, True, False, True, False, False, False, False,
-            True, True, True, True, True, True, False, True, False, True, False, False, False,
-            True, True, True, True, True, True, True, False, True, False, True, False, False,
-            True, True, True, True, True, True, False, True, False, True, False, True, False,
-            True, True, True, True, True, True, True, False, True, False, True, False, True,
-            # second seq (seq_len=10, draft_token_num=8, row_len=18)
-            True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, False, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, False, False, True, False, False, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, True, False, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, True, False,
-            True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, True, False,
-        ]
-
-        print("\n=== Testing Pure JAX Implementation ===")
-
-        actual_position = position_jax.tolist()
-        print(f"Expected position: {expected_position}")
-        print(f"Actual position:   {actual_position}")
-        self.assertEqual(actual_position, expected_position, "Position mismatch")
+        np.testing.assert_array_equal(
+            np.array(position_jax), np.array(position_ref), "Position mismatch")
         print("  Position matches!")
 
-        actual_retrive_index = retrive_index_jax.tolist()
-        self.assertEqual(actual_retrive_index, expected_retrive_index, "Retrive_index mismatch")
+        np.testing.assert_array_equal(
+            np.array(retrive_index_jax), np.array(retrive_index_ref), "Retrive_index mismatch")
         print("  Retrive_index matches!")
 
-        actual_retrive_next_token = retrive_next_token_jax.tolist()
-        self.assertEqual(actual_retrive_next_token, expected_retrive_next_token, "Retrive_next_token mismatch")
+        np.testing.assert_array_equal(
+            np.array(retrive_next_token_jax), np.array(retrive_next_token_ref), "Retrive_next_token mismatch")
         print("  Retrive_next_token matches!")
 
-        actual_retrive_next_sibling = retrive_next_sibling_jax.tolist()
-        self.assertEqual(actual_retrive_next_sibling, expected_retrive_next_sibling, "Retrive_next_sibling mismatch")
+        np.testing.assert_array_equal(
+            np.array(retrive_next_sibling_jax), np.array(retrive_next_sibling_ref), "Retrive_next_sibling mismatch")
         print("  Retrive_next_sibling matches!")
 
-        tree_mask_list = [bool(x) for x in tree_mask_jax.tolist()]
-        if len(tree_mask_list) > len(expected_tree_mask):
-            tree_mask_list = tree_mask_list[:len(expected_tree_mask)]
-        self.assertEqual(tree_mask_list, expected_tree_mask, "Tree mask mismatch")
-        print("  Tree mask matches!")
+        # Compare tree masks (truncate to reference length)
+        ref_mask = np.array(tree_mask_ref).flatten()
+        our_mask = np.array(tree_mask_jax).flatten()[:len(ref_mask)]
+        np.testing.assert_array_equal(our_mask, ref_mask, "Tree mask (FULL_MASK) mismatch")
+        print("  Tree mask (FULL_MASK) matches!")
 
-        print("Pure JAX implementation test passed!")
+        # Step 5: Compare QLEN_ONLY mode (tree_mask_mode=1)
+        tree_mask_jax_q, _, _, _, _ = build_eagle_tree_structure(
+            parent_list=parent_list,
+            selected_index=top_scores_index,
+            verified_seq_len=seq_lens,
+            draft_token_num=num_draft_token,
+            topk=topk,
+            seq_lens_sum=int(jnp.sum(seq_lens)),
+            max_context_len=int(seq_lens.max()),
+            tree_mask_mode=1,
+        )
+
+        ref_mask_q = np.array(tree_mask_ref_q).flatten()
+        our_mask_q = np.array(tree_mask_jax_q).flatten()[:len(ref_mask_q)]
+        np.testing.assert_array_equal(our_mask_q, ref_mask_q, "Tree mask (QLEN_ONLY) mismatch")
+        print("  Tree mask (QLEN_ONLY) matches!")
+
+        print("Pure JAX vs Pallas test passed!")
 
 
 if __name__ == "__main__":

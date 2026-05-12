@@ -20,9 +20,6 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
-from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
-    build_eagle_tree_structure,
-)
 from sgl_jax.srt.kernels.speculative.kernel import (
     create_extend_after_decode_spec_info,
     top_k_renorm_prob,
@@ -326,7 +323,7 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
-    from sgl_jax.srt.kernels.speculative.kernel import build_eagle_tree_structure_jax
+    from sgl_jax.srt.kernels.speculative.kernel import build_eagle_tree_structure
 
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
@@ -339,7 +336,7 @@ def build_tree_kernel_efficient(
     )
 
     tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
-        build_eagle_tree_structure_jax(
+        build_eagle_tree_structure(
             parent_list=parent_list,
             selected_index=top_scores_index,
             verified_seq_len=seq_lens,

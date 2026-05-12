@@ -687,7 +687,7 @@ def filter_finished_cache_loc_kernel(
     return output_data
 
 
-def build_eagle_tree_structure_jax(
+def build_eagle_tree_structure(
     parent_list: np.ndarray | jnp.ndarray,
     selected_index: np.ndarray | jnp.ndarray,
     verified_seq_len: np.ndarray | jnp.ndarray,
@@ -710,7 +710,8 @@ def build_eagle_tree_structure_jax(
         topk: Top-k value used in draft.
         seq_lens_sum: Sum of all sequence lengths.
         max_context_len: Max context length per request.
-        tree_mask_mode: 0=FULL_MASK, 1=COMPACT (draft-only mask, expanded before return).
+        tree_mask_mode: 0=FULL_MASK (expand to 1D with seq_len prefix),
+                        1=QLEN_ONLY (return compact draft-only mask).
 
     Returns:
         (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
@@ -720,49 +721,39 @@ def build_eagle_tree_structure_jax(
     verified_seq_len = np.asarray(verified_seq_len, dtype=np.int32)
     bs = parent_list.shape[0]
 
-    # --- Step A: Build compact tree mask (bs, draft_token_num, draft_token_num) ---
-    # compact_mask[bid, tid, j] = 1 means token tid can see token j
-    compact_mask = np.zeros((bs, draft_token_num, draft_token_num), dtype=np.int32)
-
-    # --- Step B: Compute positions ---
+    # Draft attention mask: (bs, draft_token_num, draft_token_num)
+    # draft_attn_mask[bid, tid, j] = 1 means draft token tid can attend to draft token j
+    draft_attn_mask = np.zeros((bs, draft_token_num, draft_token_num), dtype=np.int32)
     positions = np.zeros(bs * draft_token_num, dtype=np.int32)
-
-    # --- Step C: Build retrive structures ---
     retrive_index = np.full((bs, draft_token_num), -1, dtype=np.int32)
     retrive_next_token = np.full((bs, draft_token_num), -1, dtype=np.int32)
     retrive_next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int32)
 
     for bid in range(bs):
         seq_len = int(verified_seq_len[bid])
-        sel_idx = selected_index[bid]  # (draft_token_num - 1,)
+        sel_idx = selected_index[bid]
         parents = parent_list[bid]
 
-        # --- Process each token ---
         for tid in range(draft_token_num):
             global_token_idx = bid * draft_token_num + tid
 
             if tid == 0:
-                # Verified token (root) can see itself
-                compact_mask[bid, 0, 0] = 1
+                draft_attn_mask[bid, 0, 0] = 1
                 positions[global_token_idx] = seq_len
                 retrive_index[bid, tid] = global_token_idx
             else:
-                # Draft token: trace back to root via parent chain
-                cur = tid - 1  # 0-indexed into selected_index
+                cur = tid - 1
                 depth = 0
 
                 while True:
                     depth += 1
-                    # Mark ancestor visible
-                    compact_mask[bid, tid, cur + 1] = 1  # cur+1 because tid=0 is verified
+                    draft_attn_mask[bid, tid, cur + 1] = 1
 
                     parent_tb_idx = int(sel_idx[cur]) // topk
                     if parent_tb_idx == 0:
-                        # Reached root (verified token)
-                        compact_mask[bid, tid, 0] = 1
+                        draft_attn_mask[bid, tid, 0] = 1
                         break
 
-                    # Find parent's position in selected_index
                     parent_token_idx = int(parents[parent_tb_idx])
                     found = False
                     for j in range(draft_token_num - 1):
@@ -771,27 +762,23 @@ def build_eagle_tree_structure_jax(
                             found = True
                             break
                     if not found:
-                        # Parent not found in selected set, link to root
-                        compact_mask[bid, tid, 0] = 1
+                        draft_attn_mask[bid, tid, 0] = 1
                         break
 
                 positions[global_token_idx] = seq_len + depth
                 retrive_index[bid, tid] = global_token_idx
 
-        # --- Build retrive_next_token / retrive_next_sibling ---
-        # Process tokens from last to first (backwards), matching the Pallas kernel
         for i in range(draft_token_num - 1, 0, -1):
             retrive_index[bid, i] = bid * draft_token_num + i
 
             parent_tb_idx = int(sel_idx[i - 1]) // topk
 
             if parent_tb_idx > 0:
-                # Find parent position in selected_index
                 parent_token_idx = int(parents[parent_tb_idx])
                 parent_position = 0
                 for j in range(draft_token_num - 1):
                     if int(sel_idx[j]) == parent_token_idx:
-                        parent_position = j + 1  # +1 because position 0 is verified token
+                        parent_position = j + 1
                         break
             else:
                 parent_position = 0
@@ -806,10 +793,14 @@ def build_eagle_tree_structure_jax(
 
         retrive_index[bid, 0] = bid * draft_token_num
 
-    # --- Step D: Build full mask ---
-    tree_mask = _expand_compact_to_full_mask(
-        compact_mask, verified_seq_len, draft_token_num, seq_lens_sum, max_context_len, bs
-    )
+    # Build tree_mask based on mode
+    if tree_mask_mode == 0:
+        tree_mask = _expand_compact_to_full_mask(
+            draft_attn_mask, verified_seq_len, draft_token_num,
+            seq_lens_sum, max_context_len, bs,
+        )
+    else:
+        tree_mask = draft_attn_mask
 
     return (
         jnp.asarray(tree_mask, dtype=jnp.int32),
@@ -842,17 +833,17 @@ def _expand_compact_to_full_mask(
     total_size = seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
     capacity = max_context_len * draft_token_num * bs + draft_token_num * draft_token_num * bs
 
-    full_mask = np.ones(capacity, dtype=np.int32)
-    if total_size < capacity:
-        full_mask[total_size:] = 0
+    full_mask = np.zeros(capacity, dtype=np.int32)
 
     offset = 0
     for bid in range(bs):
         seq_len = int(verified_seq_len[bid])
         row_len = seq_len + draft_token_num
         for tid in range(draft_token_num):
-            start = offset + seq_len
-            full_mask[start: start + draft_token_num] = compact_mask[bid, tid]
+            # Prefix part: 1s for [0, seq_len) (can attend to all previous tokens)
+            full_mask[offset: offset + seq_len] = 1
+            # Draft part: copy from compact_mask
+            full_mask[offset + seq_len: offset + seq_len + draft_token_num] = compact_mask[bid, tid]
             offset += row_len
 
     return full_mask
