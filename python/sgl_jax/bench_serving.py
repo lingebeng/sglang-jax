@@ -600,6 +600,54 @@ class BenchmarkMetrics:
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
+@dataclass
+class VllmSpecDecodeMetrics:
+    num_draft_tokens: float
+    num_accepted_tokens: float
+
+
+def get_vllm_spec_decode_metrics(base_url: str) -> VllmSpecDecodeMetrics | None:
+    try:
+        response = requests.get(base_url + "/metrics", headers=get_auth_headers())
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Failed to fetch vLLM metrics from {base_url}/metrics. Error: {e}")
+        return None
+
+    spec_metrics = VllmSpecDecodeMetrics(0.0, 0.0)
+    for line in response.text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        metric, _, value = line.partition(" ")
+        metric_name = metric.split("{", 1)[0]
+        metric_value = float(value.split()[0])
+        if metric_name in (
+            "vllm:spec_decode_num_draft_tokens",
+            "vllm:spec_decode_num_draft_tokens_total",
+        ):
+            spec_metrics.num_draft_tokens += metric_value
+        elif metric_name in (
+            "vllm:spec_decode_num_accepted_tokens",
+            "vllm:spec_decode_num_accepted_tokens_total",
+        ):
+            spec_metrics.num_accepted_tokens += metric_value
+
+    return spec_metrics
+
+
+def diff_vllm_spec_decode_metrics(
+    start_metrics: VllmSpecDecodeMetrics | None,
+    end_metrics: VllmSpecDecodeMetrics | None,
+) -> VllmSpecDecodeMetrics | None:
+    if start_metrics is None or end_metrics is None:
+        return None
+
+    return VllmSpecDecodeMetrics(
+        num_draft_tokens=end_metrics.num_draft_tokens - start_metrics.num_draft_tokens,
+        num_accepted_tokens=end_metrics.num_accepted_tokens - start_metrics.num_accepted_tokens,
+    )
+
+
 def download_and_cache_file(url: str, filename: str | None = None):
     """Read and cache a file from a url."""
     if filename is None:
@@ -1308,6 +1356,11 @@ async def benchmark(
 
     profiler_auto_stops = False
 
+    if backend == "vllm" and args.spec == 1:
+        start_spec_decode_metrics = get_vllm_spec_decode_metrics(base_url)
+    else:
+        start_spec_decode_metrics = None
+
     # Start profiler
     if profile:
         steps_to_profile = getattr(args, "num_steps", 10)
@@ -1385,6 +1438,27 @@ async def benchmark(
     else:
         accept_length = None
 
+    if backend == "vllm" and args.spec == 1:
+        spec_decode_metrics = diff_vllm_spec_decode_metrics(
+            start_spec_decode_metrics, get_vllm_spec_decode_metrics(base_url)
+        )
+        if spec_decode_metrics is None:
+            spec_decode_num_draft_tokens = None
+            spec_decode_num_accepted_tokens = None
+            spec_decode_acceptance_rate = None
+        else:
+            spec_decode_num_draft_tokens = spec_decode_metrics.num_draft_tokens
+            spec_decode_num_accepted_tokens = spec_decode_metrics.num_accepted_tokens
+            spec_decode_acceptance_rate = (
+                spec_decode_num_accepted_tokens / spec_decode_num_draft_tokens
+                if spec_decode_num_draft_tokens
+                else 0.0
+            )
+    else:
+        spec_decode_num_draft_tokens = None
+        spec_decode_num_accepted_tokens = None
+        spec_decode_acceptance_rate = None
+
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
@@ -1420,6 +1494,18 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if spec_decode_acceptance_rate is not None:
+        print("{:<40} {:<10.0f}".format("Spec decode draft tokens:", spec_decode_num_draft_tokens))
+        print(
+            "{:<40} {:<10.0f}".format(
+                "Spec decode accepted tokens:", spec_decode_num_accepted_tokens
+            )
+        )
+        print(
+            "{:<40} {:<10.4f}".format(
+                "Spec decode acceptance rate:", spec_decode_acceptance_rate
+            )
+        )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
     print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
@@ -1479,6 +1565,14 @@ async def benchmark(
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
         }
+        if args.spec == 1:
+            result.update(
+                {
+                    "spec_decode_num_draft_tokens": spec_decode_num_draft_tokens,
+                    "spec_decode_num_accepted_tokens": spec_decode_num_accepted_tokens,
+                    "spec_decode_acceptance_rate": spec_decode_acceptance_rate,
+                }
+            )
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1551,6 +1645,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "return_routed_experts"):
         args.return_routed_experts = False
+
+    if not hasattr(args, "spec"):
+        args.spec = 0
 
     print(f"benchmark_args={args}")
 
@@ -1869,6 +1966,13 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--spec",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Collect vLLM speculative decoding metrics when set to 1",
     )
     parser.add_argument(
         "--tokenize-prompt",
