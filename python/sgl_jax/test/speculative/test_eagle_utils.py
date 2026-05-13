@@ -333,6 +333,17 @@ class TestDraftDecodeMask(CustomTestCase):
 
         self.assertEqual(mask.tolist(), expected.tolist())
 
+    def test_single_step_without_parents(self):
+        mask = build_tree_mask_for_draft_decode(
+            seq_lens=jnp.array([6]),
+            topk=3,
+            speculative_step_id=0,
+            parents_list=None,
+        )
+        expected = self._expected(6, speculative_step_id=0, topk=3)
+
+        self.assertEqual(mask.tolist(), expected.tolist())
+
     def test_multi_step(self):
         parents_rows = [None, np.array([4, 3]), np.array([6, 9])]
         parents = [

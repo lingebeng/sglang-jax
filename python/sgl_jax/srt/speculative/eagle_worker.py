@@ -345,17 +345,6 @@ class EAGLEWorker(ModelWorker):
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
             model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
-        # if we need custom mask, we should create for all at once and update it within loop
-        # we should optimize build_tree_mask_for_draft_decode to a kernel
-        if self.topk > 1:
-            self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
-                build_tree_mask_for_draft_decode(
-                    model_worker_batch.seq_lens,
-                    topk=topk_index.shape[1],
-                    speculative_step_id=0,
-                    parents_list=None,
-                )
-            )
         bs = self.precompile_bs_paddings[padding_bs_index]
         if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
             model_worker_batch.spec_info.verified_id = np.pad(
@@ -669,6 +658,16 @@ class EAGLEWorker(ModelWorker):
             if i == self.speculative_num_steps - 1:
                 break
 
+            parents_entries = [parents_list[:, : self.topk + 1]]
+            for step in range(1, i + 1):
+                parent_start = self.topk + 1 + (step - 1) * self.topk
+                parents_entries.append(parents_list[:, parent_start : parent_start + self.topk])
+            metadata_per_step[i].custom_mask = build_tree_mask_for_draft_decode(
+                model_worker_batch.seq_lens,
+                topk=self.topk,
+                speculative_step_id=i,
+                parents_list=parents_entries,
+            )
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )

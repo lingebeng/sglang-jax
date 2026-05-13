@@ -236,7 +236,7 @@ def build_tree_mask_for_draft_decode(
     seq_lens: jax.Array | np.ndarray,
     topk: int,
     speculative_step_id: int,
-    parents_list: Sequence[jax.Array],
+    parents_list: Sequence[jax.Array] | None,
 ) -> jax.Array:
     """
     Build flattened custom mask for draft decode that respects branch ancestry.
@@ -256,7 +256,9 @@ def build_tree_mask_for_draft_decode(
 
     seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
     bs = seq_lens_np.shape[0]
-    if speculative_step_id + 1 > len(parents_list):
+    if speculative_step_id > 0 and (
+        parents_list is None or speculative_step_id + 1 > len(parents_list)
+    ):
         raise ValueError("parents_list must contain at least speculative_step_id + 1 entries")
 
     # Precompute ancestry mapping: path[step, bid, branch]
