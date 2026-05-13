@@ -76,6 +76,7 @@ class RequestFuncInput:
     lora_name: str
     image_data: str
     extra_request_body: dict[str, Any]
+    tokenizer: PreTrainedTokenizerBase | None = None
 
 
 @dataclass
@@ -86,6 +87,7 @@ class RequestFuncOutput:
     ttft: float = 0.0  # Time to first token
     # List of inter-token latencies
     itl: list[float] = field(default_factory=list)
+    adjusted_itl: list[float] = field(default_factory=list)
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
@@ -217,6 +219,7 @@ async def async_request_openai_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        last_output_len = 0
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -235,22 +238,40 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            text = data["choices"][0]["text"]
+                            if text:
                                 timestamp = time.perf_counter()
+                                generated_text += text
+                                if request_func_input.tokenizer is None:
+                                    new_output_len = (data.get("usage") or {}).get(
+                                        "completion_tokens", output_len
+                                    )
+                                else:
+                                    new_output_len = len(
+                                        request_func_input.tokenizer.encode(
+                                            generated_text, add_special_tokens=False
+                                        )
+                                    )
+                                num_new_tokens = new_output_len - last_output_len
+                                output_len = new_output_len
+
                                 # First token
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
                                 else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                                    raw_itl = timestamp - most_recent_timestamp
+                                    output.itl.append(raw_itl)
+                                    if num_new_tokens > 0:
+                                        adjusted_itl = raw_itl / num_new_tokens
+                                        output.adjusted_itl.extend(
+                                            [adjusted_itl] * num_new_tokens
+                                        )
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                last_output_len = new_output_len
 
                     output.generated_text = generated_text
                     output.success = True
@@ -590,6 +611,12 @@ class BenchmarkMetrics:
     p95_itl_ms: float
     p99_itl_ms: float
     max_itl_ms: float
+    mean_adjusted_itl_ms: float
+    median_adjusted_itl_ms: float
+    std_adjusted_itl_ms: float
+    p95_adjusted_itl_ms: float
+    p99_adjusted_itl_ms: float
+    max_adjusted_itl_ms: float
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
@@ -1212,6 +1239,7 @@ def calculate_metrics(
     total_input = 0
     completed = 0
     itls: list[float] = []
+    adjusted_itls: list[float] = []
     tpots: list[float] = []
     ttfts: list[float] = []
     e2e_latencies: list[float] = []
@@ -1227,6 +1255,7 @@ def calculate_metrics(
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
+            adjusted_itls += outputs[i].adjusted_itl or outputs[i].itl
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1268,6 +1297,12 @@ def calculate_metrics(
         p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         max_itl_ms=np.max(itls or 0) * 1000,
+        mean_adjusted_itl_ms=np.mean(adjusted_itls or 0) * 1000,
+        median_adjusted_itl_ms=np.median(adjusted_itls or 0) * 1000,
+        std_adjusted_itl_ms=np.std(adjusted_itls or 0) * 1000,
+        p95_adjusted_itl_ms=np.percentile(adjusted_itls or 0, 95) * 1000,
+        p99_adjusted_itl_ms=np.percentile(adjusted_itls or 0, 99) * 1000,
+        max_adjusted_itl_ms=np.max(adjusted_itls or 0) * 1000,
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
@@ -1328,6 +1363,7 @@ async def benchmark(
         lora_name=lora_name,
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,
+        tokenizer=tokenizer,
     )
 
     # Run warmup requests
@@ -1403,6 +1439,7 @@ async def benchmark(
             lora_name=lora_name,
             image_data=request.image_data,
             extra_request_body=extra_request_body,
+            tokenizer=tokenizer,
         )
 
         tasks.append(
@@ -1519,6 +1556,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    print("{s:{c}^{n}}".format(s="Adjusted Inter-Token Latency", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean Adjusted ITL (ms):", metrics.mean_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("Median Adjusted ITL (ms):", metrics.median_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("P95 Adjusted ITL (ms):", metrics.p95_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("P99 Adjusted ITL (ms):", metrics.p99_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("Max Adjusted ITL (ms):", metrics.max_adjusted_itl_ms))
     print("=" * 50)
 
     if (
@@ -1562,6 +1605,11 @@ async def benchmark(
             "std_itl_ms": metrics.std_itl_ms,
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
+            "mean_adjusted_itl_ms": metrics.mean_adjusted_itl_ms,
+            "median_adjusted_itl_ms": metrics.median_adjusted_itl_ms,
+            "std_adjusted_itl_ms": metrics.std_adjusted_itl_ms,
+            "p95_adjusted_itl_ms": metrics.p95_adjusted_itl_ms,
+            "p99_adjusted_itl_ms": metrics.p99_adjusted_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
         }
@@ -1592,6 +1640,7 @@ async def benchmark(
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
+        "adjusted_itls": [output.adjusted_itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
