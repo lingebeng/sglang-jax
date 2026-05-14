@@ -42,8 +42,16 @@ class EAGLEWorker(ModelWorker):
         self.target_worker = target_worker
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
-        self.topk = server_args.speculative_eagle_topk
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        max_candidates = 1 + (self.speculative_num_steps - 1) * self.topk
+        if self.speculative_num_draft_tokens - 1 > max_candidates:
+            raise ValueError(
+                f"speculative_num_draft_tokens ({self.speculative_num_draft_tokens}) is too large "
+                f"for speculative_num_steps={self.speculative_num_steps} and "
+                f"speculative_eagle_topk={self.topk}. "
+                f"Maximum allowed: {max_candidates + 1} "
+                f"(need num_draft_tokens - 1 <= 1 + (num_steps - 1) * topk)"
+            )
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
