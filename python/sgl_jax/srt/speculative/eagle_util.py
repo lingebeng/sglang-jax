@@ -243,7 +243,8 @@ def build_tree_mask_for_draft_decode(
     seq_lens: jax.Array | np.ndarray,
     topk: int,
     speculative_step_id: int,
-    parents_list: Sequence[jax.Array],
+    parents_list: Sequence[jax.Array] | None,
+    max_kv_len: int | None = None,
 ) -> jax.Array:
     """
     Build flattened custom mask for draft decode that respects branch ancestry.
@@ -253,9 +254,11 @@ def build_tree_mask_for_draft_decode(
         topk: Number of speculative branches processed in parallel.
         speculative_step_id: Current speculative step (0-indexed).
         parents_list: List of parent index tensors produced by ``select_top_k_tokens``.
+        max_kv_len: If provided, pad each request's mask to this KV length
+            so the output shape is static (bs * topk * max_kv_len).
 
     Returns:
-        Flattened boolean mask concatenating ``topk`` rows per request.
+        Flattened int32 mask concatenating ``topk`` rows per request.
     """
 
     if topk <= 0:
@@ -263,7 +266,9 @@ def build_tree_mask_for_draft_decode(
 
     seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
     bs = seq_lens_np.shape[0]
-    if speculative_step_id + 1 > len(parents_list):
+    if parents_list is None:
+        parents_list = []
+    if speculative_step_id > 0 and speculative_step_id + 1 > len(parents_list):
         raise ValueError("parents_list must contain at least speculative_step_id + 1 entries")
 
     # Precompute ancestry mapping: path[step, bid, branch]
@@ -277,11 +282,16 @@ def build_tree_mask_for_draft_decode(
             child_branch_ids = ancestry[step, bid]
             ancestry[step - 1, bid] = parent_indices[bid, child_branch_ids]
 
+    draft_kv = (speculative_step_id + 1) * topk
+    if max_kv_len is None:
+        padded_kv_len = int(np.max(seq_lens_np)) + draft_kv
+    else:
+        padded_kv_len = max_kv_len
+
     masks: list[np.ndarray] = []
     for bid in range(bs):
         seq_len = int(seq_lens_np[bid])
-        kv_len = seq_len + (speculative_step_id + 1) * topk
-        mask = np.zeros((topk, kv_len), dtype=np.bool_)
+        mask = np.zeros((topk, padded_kv_len), dtype=np.bool_)
         mask[:, :seq_len] = True
 
         for branch in range(topk):
@@ -293,7 +303,7 @@ def build_tree_mask_for_draft_decode(
         masks.append(mask.reshape(-1))
 
     if not masks:
-        return jnp.zeros((0,), dtype=jnp.bool_)
+        return jnp.zeros((0,), dtype=jnp.int32)
 
     concatenated = np.concatenate(masks)
     return jnp.asarray(concatenated, dtype=jnp.int32)
