@@ -672,6 +672,7 @@ class EAGLEWorker(ModelWorker):
             sharding=(NamedSharding(self.model_runner.mesh, P())),
         )
         logits_metadata = None
+        saved_custom_mask = self.draft_model_runner.attn_backend.forward_metadata.custom_mask
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
             model_worker_batch,
         )
@@ -702,6 +703,7 @@ class EAGLEWorker(ModelWorker):
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
+            self.draft_model_runner.attn_backend.forward_metadata.custom_mask = saved_custom_mask
 
             # Run forward
             forward_batch.bid = model_worker_batch.bid
@@ -919,7 +921,7 @@ def select_top_k_tokens_step_0(
         jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
         topk_index,  # shape: (b, topk)
         jnp.tile(
-            jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.float32), axis=0),
+            jnp.expand_dims(jnp.concatenate([jnp.array([-1.0]), jnp.zeros(topk, dtype=jnp.float32)]), axis=0),
             (topk_p.shape[0], 1),
         ),  # shape: (b, topk + 1)
     )

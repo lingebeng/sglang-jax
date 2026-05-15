@@ -344,6 +344,8 @@ class SchedulerOutputProcessorMixin:
                 elif self.spec_algorithm.is_eagle():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
+                    req.kv_committed_len += new_accepted_len
+                    req.kv_allocated_len += new_accepted_len
 
                 req.check_finished(new_accepted_len)
 
