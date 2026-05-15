@@ -355,6 +355,17 @@ class EAGLEWorker(ModelWorker):
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
             model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
+        # if we need custom mask, we should create for all at once and update it within loop
+        # we should optimize build_tree_mask_for_draft_decode to a kernel
+        if self.topk > 1:
+            self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
+                build_tree_mask_for_draft_decode(
+                    model_worker_batch.seq_lens,
+                    topk=topk_index.shape[1],
+                    speculative_step_id=0,
+                    parents_list=None,
+                )
+            )
         bs = self.precompile_bs_paddings[padding_bs_index]
         if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
             model_worker_batch.spec_info.verified_id = np.pad(
@@ -430,7 +441,7 @@ class EAGLEWorker(ModelWorker):
         )
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
-            custom_mask=tree_mask, # tree mask 在这里使用，后续的 verify 和 sample 都会使用这个 mask 来保证正确的依赖关系
+            custom_mask=tree_mask,  # tree mask 在这里使用，后续的 verify 和 sample 都会使用这个 mask 来保证正确的依赖关系
             positions=position,
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
@@ -687,11 +698,6 @@ class EAGLEWorker(ModelWorker):
             if i == self.speculative_num_steps - 1:
                 break
 
-            # FIXME(topk): draft attention with custom_mask=True triggers extremely
-            # slow XLA compilation (>300s). Skip custom_mask for now and use causal
-            # attention. This slightly hurts accuracy for topk>1 (branches attend
-            # to sibling tokens) but unblocks the pipeline. Replace with a Pallas
-            # kernel for build_tree_mask_for_draft_decode to fix properly.
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
