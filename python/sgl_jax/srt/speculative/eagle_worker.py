@@ -167,12 +167,6 @@ class EAGLEWorker(BaseSpecWorker):
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
-        # accept_index uses -1 for rejected slots; gathering with -1 picks the
-        # global last element, so dext later writes rejected tokens' draft-KV at
-        # a foreign position inside each req's page (corrupts prefix KV for all
-        # but the last req at bs>1). Redirect -1 to each req's own last slot.
-        # accept_index has length bs*(spec_steps+1); the gathered tensors have
-        # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
         draft_n = self.speculative_num_draft_tokens
         accept_width = self.speculative_num_steps + 1
         req_ids = np.arange(len(accept_index)) // accept_width
