@@ -232,6 +232,7 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self._sync_greedy_spec_info(model_worker_batch, forward_batch.spec_info)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -280,8 +281,52 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
+        self._sync_greedy_spec_info(model_worker_batch, batch_output.next_draft_input)
 
     # -- Internal draft helpers --
+
+    def _is_greedy_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        return (
+            model_worker_batch.real_bs > 1
+            and model_worker_batch.sampling_info is not None
+            and model_worker_batch.sampling_info.is_all_greedy
+        )
+
+    @staticmethod
+    def _tile_seq0(arr: jax.Array, block_size: int) -> jax.Array:
+        sharding = arr.sharding
+        a = np.array(jax.device_get(arr))
+        seq0 = a[:block_size].copy()
+        n_blocks = a.shape[0] // block_size
+        for i in range(1, n_blocks):
+            a[i * block_size : (i + 1) * block_size] = seq0
+        return jax.device_put(jnp.array(a), sharding)
+
+    def _sync_greedy_spec_info(
+        self, model_worker_batch: ModelWorkerBatch, spec_info: EagleDraftInput
+    ):
+        if not self._is_greedy_batch(model_worker_batch):
+            return
+        for attr in ("topk_p", "topk_index", "hidden_states"):
+            arr = getattr(spec_info, attr, None)
+            if arr is not None and hasattr(arr, "shape") and arr.shape[0] > 1:
+                setattr(spec_info, attr, self._tile_seq0(arr, 1))
+
+    def _sync_greedy_draft_step(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        topk_p: jax.Array,
+        topk_index: jax.Array,
+        hidden_states: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        if not self._is_greedy_batch(model_worker_batch):
+            return topk_p, topk_index, hidden_states
+        topk = self.topk
+        return (
+            self._tile_seq0(topk_p, topk),
+            self._tile_seq0(topk_index, topk),
+            self._tile_seq0(hidden_states, topk),
+        )
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
@@ -452,6 +497,10 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+
+            topk_p, topk_index, hidden_states = self._sync_greedy_draft_step(
+                model_worker_batch, topk_p, topk_index, hidden_states
+            )
 
         return score_list, token_list, parents_list
 

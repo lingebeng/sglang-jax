@@ -93,6 +93,8 @@ class EAGLEWorker(BaseSpecWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
+            next_token_ids = self._sync_greedy_extend(model_worker_batch, logits_output, next_token_ids)
+
             # draft extend for Update Draft State
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
@@ -139,6 +141,63 @@ class EAGLEWorker(BaseSpecWorker):
             model_worker_batch.seq_lens,
         )
 
+    # -- Greedy sync helpers --
+
+    def _is_greedy_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        return (
+            model_worker_batch.real_bs > 1
+            and model_worker_batch.sampling_info is not None
+            and model_worker_batch.sampling_info.is_all_greedy
+        )
+
+    @staticmethod
+    def _tile_seq0(arr: jax.Array, block_size: int) -> jax.Array:
+        """Copy seq0's block to all other blocks via numpy round-trip."""
+        sharding = arr.sharding
+        a = np.array(jax.device_get(arr))
+        seq0 = a[:block_size].copy()
+        n_blocks = a.shape[0] // block_size
+        for i in range(1, n_blocks):
+            a[i * block_size : (i + 1) * block_size] = seq0
+        return jax.device_put(jnp.array(a), sharding)
+
+    def _sync_greedy_extend(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: jax.Array,
+    ) -> jax.Array:
+        if not self._is_greedy_batch(model_worker_batch):
+            return next_token_ids
+        logits_output.next_token_logits = self._tile_seq0(
+            logits_output.next_token_logits, 1
+        )
+        if logits_output.hidden_states is not None:
+            ext_lens = model_worker_batch.extend_seq_lens
+            if ext_lens is not None and len(ext_lens) >= model_worker_batch.real_bs and int(ext_lens[0]) > 0:
+                block = int(ext_lens[0])
+            else:
+                block = 1
+            logits_output.hidden_states = self._tile_seq0(
+                logits_output.hidden_states, block
+            )
+        return self._tile_seq0(next_token_ids, 1)
+
+    def _sync_greedy_verify(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+    ):
+        if not self._is_greedy_batch(model_worker_batch):
+            return
+        draft_n = self.speculative_num_draft_tokens
+        logits_output.next_token_logits = self._tile_seq0(
+            logits_output.next_token_logits, draft_n
+        )
+        logits_output.hidden_states = self._tile_seq0(
+            logits_output.hidden_states, draft_n
+        )
+
     # -- Verify --
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
@@ -155,6 +214,9 @@ class EAGLEWorker(BaseSpecWorker):
         logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
+
+        self._sync_greedy_verify(model_worker_batch, logits_output)
+
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
