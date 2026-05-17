@@ -259,6 +259,7 @@ class SchedulerOutputProcessorMixin:
             predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_lens[i]
+            req.kv_committed_len += accept_lens[i]
 
         return predict_tokens
 
