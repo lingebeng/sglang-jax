@@ -232,7 +232,30 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
-        self._sync_greedy_spec_info(model_worker_batch, forward_batch.spec_info)
+
+        # --- DEBUG: check draft extend outputs across seqs ---
+        if (model_worker_batch.real_bs > 1
+                and model_worker_batch.sampling_info is not None
+                and model_worker_batch.sampling_info.is_all_greedy):
+            bs = model_worker_batch.real_bs
+            topk_p_np = np.array(jax.device_get(forward_batch.spec_info.topk_p))
+            topk_idx_np = np.array(jax.device_get(forward_batch.spec_info.topk_index))
+            hs_np = np.array(jax.device_get(forward_batch.spec_info.hidden_states))
+            logits_np = np.array(jax.device_get(logits_output.next_token_logits))
+            logger.info("[DRAFT_EXTEND_DEBUG] real_bs=%d", bs)
+            for s in range(bs):
+                logger.info(
+                    "[DRAFT_EXTEND_DEBUG] seq=%d topk_p=%s topk_index=%s",
+                    s, topk_p_np[s].tolist(), topk_idx_np[s].tolist(),
+                )
+            for s in range(1, bs):
+                logits_diff = float(np.max(np.abs(logits_np[0] - logits_np[s])))
+                hs_diff = float(np.max(np.abs(hs_np[0] - hs_np[s])))
+                logger.info(
+                    "[DRAFT_EXTEND_DEBUG] seq0 vs seq%d: logits_max_diff=%.6e hs_max_diff=%.6e",
+                    s, logits_diff, hs_diff,
+                )
+        # --- END DEBUG ---
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -258,16 +281,22 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=logits_metadata,
         )
+        # Token-level index: for hidden_states (per-token, shape: total_tokens)
+        # and verified_id (per-token, step_plus_1 entries per seq).
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * step_plus_1
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
+        # Seq-level index: for logits (per-seq, one row per request).
+        # logits shape is (num_seqs, vocab) — NOT (total_tokens, vocab).
+        logits_select_index = np.arange(model_worker_batch.real_bs)
+
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        draft_logits_output.next_token_logits = rep_logits[select_index]
+        draft_logits_output.next_token_logits = rep_logits[logits_select_index]
         draft_logits_output.hidden_states = rep_hidden[select_index]
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
@@ -281,52 +310,29 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
-        self._sync_greedy_spec_info(model_worker_batch, batch_output.next_draft_input)
+
+        # --- DEBUG: check draft_extend_for_decode outputs ---
+        if (model_worker_batch.real_bs > 1
+                and model_worker_batch.sampling_info is not None
+                and model_worker_batch.sampling_info.is_all_greedy):
+            real_bs = model_worker_batch.real_bs
+            tp_np = np.array(jax.device_get(topk_p))
+            ti_np = np.array(jax.device_get(topk_index))
+            hs_np = np.array(jax.device_get(draft_logits_output.hidden_states))
+            logger.info("[DRAFT_DECODE_EXT_DEBUG] real_bs=%d select_index=%s accept_lens=%s",
+                        real_bs, select_index.tolist(),
+                        batch_output.accept_lens[:real_bs].tolist())
+            for s in range(real_bs):
+                logger.info("[DRAFT_DECODE_EXT_DEBUG] seq=%d topk_p=%s topk_index=%s",
+                            s, tp_np[s].tolist(), ti_np[s].tolist())
+            for s in range(1, real_bs):
+                hs_diff = float(np.max(np.abs(hs_np[0] - hs_np[s])))
+                tp_diff = float(np.max(np.abs(tp_np[0] - tp_np[s])))
+                logger.info("[DRAFT_DECODE_EXT_DEBUG] seq0 vs seq%d: hs_max_diff=%.6e topk_p_diff=%.6e topk_idx_match=%s",
+                            s, hs_diff, tp_diff, bool(np.array_equal(ti_np[0], ti_np[s])))
+        # --- END DEBUG ---
 
     # -- Internal draft helpers --
-
-    def _is_greedy_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
-        return (
-            model_worker_batch.real_bs > 1
-            and model_worker_batch.sampling_info is not None
-            and model_worker_batch.sampling_info.is_all_greedy
-        )
-
-    @staticmethod
-    def _tile_seq0(arr: jax.Array, block_size: int) -> jax.Array:
-        sharding = arr.sharding
-        a = np.array(jax.device_get(arr))
-        seq0 = a[:block_size].copy()
-        n_blocks = a.shape[0] // block_size
-        for i in range(1, n_blocks):
-            a[i * block_size : (i + 1) * block_size] = seq0
-        return jax.device_put(jnp.array(a), sharding)
-
-    def _sync_greedy_spec_info(
-        self, model_worker_batch: ModelWorkerBatch, spec_info: EagleDraftInput
-    ):
-        if not self._is_greedy_batch(model_worker_batch):
-            return
-        for attr in ("topk_p", "topk_index", "hidden_states"):
-            arr = getattr(spec_info, attr, None)
-            if arr is not None and hasattr(arr, "shape") and arr.shape[0] > 1:
-                setattr(spec_info, attr, self._tile_seq0(arr, 1))
-
-    def _sync_greedy_draft_step(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        topk_p: jax.Array,
-        topk_index: jax.Array,
-        hidden_states: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        if not self._is_greedy_batch(model_worker_batch):
-            return topk_p, topk_index, hidden_states
-        topk = self.topk
-        return (
-            self._tile_seq0(topk_p, topk),
-            self._tile_seq0(topk_index, topk),
-            self._tile_seq0(hidden_states, topk),
-        )
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
@@ -368,6 +374,45 @@ class EagleDraftWorker(BaseDraftWorker):
                         seq_idx, :allocate_len
                     ]
                     offset += aligned_len
+
+        # --- DEBUG: check cache_loc prefix sharing ---
+        if (model_worker_batch.real_bs > 1
+                and model_worker_batch.sampling_info is not None
+                and model_worker_batch.sampling_info.is_all_greedy
+                and len(cache_loc_flat) > 0):
+            real_bs = model_worker_batch.real_bs
+            logger.info(
+                "[DRAFT_CACHE_DEBUG] real_bs=%d seq_lens=%s allocate_lens=%s",
+                real_bs, seq_lens_cpu[:real_bs].tolist(),
+                spec_info.allocate_lens[:real_bs].tolist(),
+            )
+            offsets = []
+            off = 0
+            for idx in valid_indices[:real_bs]:
+                al = int(spec_info.allocate_lens[idx])
+                aligned = ((al + page_size - 1) // page_size) * page_size
+                offsets.append((off, al, aligned))
+                off += aligned
+            if len(offsets) >= 2:
+                off0, al0, _ = offsets[0]
+                cache_0 = cache_loc_flat[off0 : off0 + al0]
+                for s_idx in range(1, len(offsets)):
+                    off_s, al_s, _ = offsets[s_idx]
+                    cache_s = cache_loc_flat[off_s : off_s + al_s]
+                    common = min(al0, al_s)
+                    match_mask = cache_0[:common] == cache_s[:common]
+                    shared = int(np.sum(match_mask))
+                    diffs = np.where(~match_mask)[0]
+                    first_diff = int(diffs[0]) if len(diffs) > 0 else common
+                    logger.info(
+                        "[DRAFT_CACHE_DEBUG] seq0 vs seq%d: common=%d shared=%d first_diff_pos=%d "
+                        "cache0[:5]=%s cache_s[:5]=%s cache0[-3:]=%s cache_s[-3:]=%s",
+                        s_idx, common, shared, first_diff,
+                        cache_0[:5].tolist(), cache_s[:5].tolist(),
+                        cache_0[max(0, al0-3):al0].tolist(), cache_s[max(0, al_s-3):al_s].tolist(),
+                    )
+        # --- END DEBUG ---
+
         total_cache_loc_size = self.precompile_cache_loc_paddings[padding_bs_index]
         assert total_cache_loc_size >= len(cache_loc_flat)
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
@@ -460,6 +505,27 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         parents_history: list[jax.Array] = []
+        _is_greedy_debug = (
+            model_worker_batch.real_bs > 1
+            and model_worker_batch.sampling_info is not None
+            and model_worker_batch.sampling_info.is_all_greedy
+        )
+        if _is_greedy_debug:
+            real_bs = model_worker_batch.real_bs
+            tp_np = np.array(jax.device_get(topk_p))
+            ti_np = np.array(jax.device_get(topk_index))
+            hs_np = np.array(jax.device_get(hidden_states))
+            logger.info("[DRAFT_FWD_DEBUG] === draft_forward start real_bs=%d topk=%d steps=%d ===",
+                        real_bs, self.topk, self.speculative_num_steps)
+            for s in range(real_bs):
+                logger.info("[DRAFT_FWD_DEBUG] init seq=%d topk_p=%s topk_index=%s",
+                            s, tp_np[s].tolist(), ti_np[s].tolist())
+            for s in range(1, real_bs):
+                hs_diff = float(np.max(np.abs(hs_np[0] - hs_np[s])))
+                tp_diff = float(np.max(np.abs(tp_np[0] - tp_np[s])))
+                logger.info("[DRAFT_FWD_DEBUG] init seq0 vs seq%d: hs_max_diff=%.6e topk_p_diff=%.6e",
+                            s, hs_diff, tp_diff)
+
         for i in range(self.speculative_num_steps):
 
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
@@ -471,6 +537,19 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             if i == self.speculative_num_steps - 1:
                 break
+
+            # --- DEBUG: log inputs to draft forward step ---
+            if _is_greedy_debug:
+                ids_np = np.array(jax.device_get(input_ids))
+                hs_pre_np = np.array(jax.device_get(hidden_states))
+                pos_np = np.array(jax.device_get(positions_base + i))
+                logger.info("[DRAFT_FWD_DEBUG] step=%d input_ids=%s positions=%s",
+                            i, ids_np[:real_bs].tolist(), pos_np[:real_bs].tolist())
+                for s in range(1, real_bs):
+                    hs_d = float(np.max(np.abs(hs_pre_np[0] - hs_pre_np[s])))
+                    logger.info("[DRAFT_FWD_DEBUG] step=%d pre-fwd seq0 vs seq%d: hs_max_diff=%.6e ids_match=%s",
+                                i, s, hs_d, bool(ids_np[0] == ids_np[s]))
+            # --- END DEBUG ---
 
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
@@ -494,13 +573,26 @@ class EagleDraftWorker(BaseDraftWorker):
 
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
 
+            # --- DEBUG: log outputs of draft forward step ---
+            if _is_greedy_debug:
+                logits_np = np.array(jax.device_get(logits_output.next_token_logits))
+                tp_np = np.array(jax.device_get(topk_p))
+                ti_np = np.array(jax.device_get(topk_index))
+                hs_post_np = np.array(jax.device_get(logits_output.hidden_states))
+                logger.info("[DRAFT_FWD_DEBUG] step=%d post-fwd topk results:", i)
+                for s in range(real_bs):
+                    logger.info("[DRAFT_FWD_DEBUG]   seq=%d topk_p=%s topk_index=%s argmax=%d",
+                                s, tp_np[s].tolist(), ti_np[s].tolist(), int(np.argmax(logits_np[s])))
+                for s in range(1, real_bs):
+                    logits_d = float(np.max(np.abs(logits_np[0] - logits_np[s])))
+                    hs_d = float(np.max(np.abs(hs_post_np[0] - hs_post_np[s])))
+                    logger.info("[DRAFT_FWD_DEBUG]   step=%d seq0 vs seq%d: logits_max_diff=%.6e hs_max_diff=%.6e",
+                                i, s, logits_d, hs_d)
+            # --- END DEBUG ---
+
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
-
-            topk_p, topk_index, hidden_states = self._sync_greedy_draft_step(
-                model_worker_batch, topk_p, topk_index, hidden_states
-            )
 
         return score_list, token_list, parents_list
 

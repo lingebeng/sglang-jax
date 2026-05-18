@@ -93,7 +93,22 @@ class EAGLEWorker(BaseSpecWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
-            next_token_ids = self._sync_greedy_extend(model_worker_batch, logits_output, next_token_ids)
+
+            # --- DEBUG: extend divergence check ---
+            if (model_worker_batch.real_bs > 1
+                    and model_worker_batch.sampling_info is not None
+                    and model_worker_batch.sampling_info.is_all_greedy):
+                bs = model_worker_batch.real_bs
+                ids_np = np.array(jax.device_get(next_token_ids))
+                logger.info(
+                    "[GREEDY_EXTEND_DEBUG] real_bs=%d next_token_ids=%s",
+                    bs, ids_np[:bs].tolist(),
+                )
+                if len(set(ids_np[:bs].tolist())) > 1:
+                    logger.warning(
+                        "[GREEDY_EXTEND_DEBUG] EXTEND TOKEN DIVERGENCE!"
+                    )
+            # --- END DEBUG ---
 
             # draft extend for Update Draft State
             self.draft_worker.draft_extend_for_prefill(
@@ -141,63 +156,6 @@ class EAGLEWorker(BaseSpecWorker):
             model_worker_batch.seq_lens,
         )
 
-    # -- Greedy sync helpers --
-
-    def _is_greedy_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
-        return (
-            model_worker_batch.real_bs > 1
-            and model_worker_batch.sampling_info is not None
-            and model_worker_batch.sampling_info.is_all_greedy
-        )
-
-    @staticmethod
-    def _tile_seq0(arr: jax.Array, block_size: int) -> jax.Array:
-        """Copy seq0's block to all other blocks via numpy round-trip."""
-        sharding = arr.sharding
-        a = np.array(jax.device_get(arr))
-        seq0 = a[:block_size].copy()
-        n_blocks = a.shape[0] // block_size
-        for i in range(1, n_blocks):
-            a[i * block_size : (i + 1) * block_size] = seq0
-        return jax.device_put(jnp.array(a), sharding)
-
-    def _sync_greedy_extend(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        logits_output: LogitsProcessorOutput,
-        next_token_ids: jax.Array,
-    ) -> jax.Array:
-        if not self._is_greedy_batch(model_worker_batch):
-            return next_token_ids
-        logits_output.next_token_logits = self._tile_seq0(
-            logits_output.next_token_logits, 1
-        )
-        if logits_output.hidden_states is not None:
-            ext_lens = model_worker_batch.extend_seq_lens
-            if ext_lens is not None and len(ext_lens) >= model_worker_batch.real_bs and int(ext_lens[0]) > 0:
-                block = int(ext_lens[0])
-            else:
-                block = 1
-            logits_output.hidden_states = self._tile_seq0(
-                logits_output.hidden_states, block
-            )
-        return self._tile_seq0(next_token_ids, 1)
-
-    def _sync_greedy_verify(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        logits_output: LogitsProcessorOutput,
-    ):
-        if not self._is_greedy_batch(model_worker_batch):
-            return
-        draft_n = self.speculative_num_draft_tokens
-        logits_output.next_token_logits = self._tile_seq0(
-            logits_output.next_token_logits, draft_n
-        )
-        logits_output.hidden_states = self._tile_seq0(
-            logits_output.hidden_states, draft_n
-        )
-
     # -- Verify --
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
@@ -215,7 +173,40 @@ class EAGLEWorker(BaseSpecWorker):
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
 
-        self._sync_greedy_verify(model_worker_batch, logits_output)
+        # --- DEBUG: diagnose greedy verify divergence ---
+        if (model_worker_batch.real_bs > 1
+                and model_worker_batch.sampling_info is not None
+                and model_worker_batch.sampling_info.is_all_greedy):
+            bs = model_worker_batch.real_bs
+            draft_n = self.speculative_num_draft_tokens
+            logits_np = np.array(jax.device_get(logits_output.next_token_logits))
+            # logits shape: (bs * draft_n, vocab)
+            argmax_all = np.argmax(logits_np, axis=-1)
+            draft_tok = np.array(jax.device_get(spec_info.draft_token))
+            logger.info("[GREEDY_VERIFY_DEBUG] real_bs=%d draft_n=%d", bs, draft_n)
+            logger.info("[GREEDY_VERIFY_DEBUG] seq_lens=%s", model_worker_batch.seq_lens[:bs])
+            for s in range(bs):
+                start = s * draft_n
+                end = start + draft_n
+                logger.info(
+                    "[GREEDY_VERIFY_DEBUG] seq=%d draft_tokens=%s target_argmax=%s",
+                    s, draft_tok[start:end].tolist(), argmax_all[start:end].tolist(),
+                )
+            # Check if all seqs have identical target argmax at root position
+            root_argmax = [argmax_all[s * draft_n] for s in range(bs)]
+            if len(set(root_argmax)) > 1:
+                logger.warning(
+                    "[GREEDY_VERIFY_DEBUG] ROOT ARGMAX DIVERGENCE! roots=%s",
+                    root_argmax,
+                )
+            # Check if all seqs have identical logits at root
+            root_logits = [logits_np[s * draft_n] for s in range(bs)]
+            max_diff = max(
+                np.max(np.abs(root_logits[0] - root_logits[i]))
+                for i in range(1, bs)
+            )
+            logger.info("[GREEDY_VERIFY_DEBUG] root logits max_diff=%.6e", max_diff)
+        # --- END DEBUG ---
 
         spec_info.hidden_states = logits_output.hidden_states
         (
@@ -229,6 +220,24 @@ class EAGLEWorker(BaseSpecWorker):
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+
+        # --- DEBUG: post-sample ---
+        if (model_worker_batch.real_bs > 1
+                and model_worker_batch.sampling_info is not None
+                and model_worker_batch.sampling_info.is_all_greedy):
+            bs = model_worker_batch.real_bs
+            logger.info(
+                "[GREEDY_VERIFY_DEBUG] accept_length=%s predict=%s",
+                accept_length[:bs].tolist(),
+                predict.tolist(),
+            )
+            logger.info(
+                "[GREEDY_VERIFY_DEBUG] verified_id=%s accept_index=%s",
+                verified_id.tolist(),
+                accept_index.tolist(),
+            )
+        # --- END DEBUG ---
+
         draft_n = self.speculative_num_draft_tokens
         accept_width = self.speculative_num_steps + 1
         req_ids = np.arange(len(accept_index)) // accept_width
