@@ -20,6 +20,11 @@ from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
+try:
+    from argus.jax import dumpable
+except ImportError:
+    dumpable = None
+
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
@@ -254,6 +259,7 @@ class QWen3DecoderLayer(nnx.Module):
             scope_name="post_attention_layernorm",
         )
 
+    @(dumpable(name_fn=lambda self: f"layer_{self.layer_id}", output_fields=[0]) if dumpable else lambda f: f)
     def __call__(
         self,
         positions: jax.Array,
@@ -287,6 +293,7 @@ class QWen3DecoderLayer(nnx.Module):
             hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
         )
         layer_callback_flag.append(attn_callback_flag)
+
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -337,6 +344,7 @@ class QWen3Model(nnx.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+    @(dumpable(name_fn=lambda self: "final_hidden", output_fields=[0]) if dumpable else lambda f: f)
     def __call__(
         self,
         forward_batch: ForwardBatch,

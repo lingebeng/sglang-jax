@@ -1,6 +1,7 @@
 """ModelRunner runs the forward passes of the models."""
 
 import logging
+import os
 from functools import partial
 
 import jax
@@ -134,6 +135,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         total_device_memory = self.get_available_device_memory()
         self.init_attention_backend()
         self.load_model()
+
+        from sgl_jax.srt.argus_dumper import setup_argus_dump
+
+        setup_argus_dump(
+            global_rank=jax.process_index(),
+            mesh_shape={"tp": self.tp_size},
+        )
 
         # Check if the model is using hybrid SWA
         if (
@@ -515,8 +523,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+
+        from sgl_jax.srt.argus_dumper import advance_step, finalize_argus_dump, is_argus_active
+
+        if is_argus_active():
+            advance_step(forward_batch)
+
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
+
+        if is_argus_active():
+            max_fwd = int(os.environ.get("ARGUS_DUMP_MAX_REQUESTS", "1"))
+            if self.forward_pass_id >= max_fwd:
+                finalize_argus_dump()
+
         return ret
 
     def _forward_raw(

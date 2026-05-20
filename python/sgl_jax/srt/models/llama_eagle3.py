@@ -35,6 +35,11 @@ from sgl_jax.srt.models.llama import (
 )
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
+try:
+    from argus.jax import dumpable  # noqa: F401
+except ImportError:
+    dumpable = None
+
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
