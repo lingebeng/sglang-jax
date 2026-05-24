@@ -99,6 +99,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         self.hidden_norm = RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps)
 
+    @(dumpable(name_fn=lambda self: f"eagle3.layer_{self.layer_id}", output_fields=[0]) if dumpable else lambda f: f)
     def __call__(
         self,
         positions: jax.Array,
@@ -186,6 +187,7 @@ class LlamaEagleModel(LlamaModel):
 
         self.norm = RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps)
 
+    @(dumpable(name_fn=lambda self: "eagle3.model", output_fields=[0]) if dumpable else lambda f: f)
     def __call__(
         self,
         forward_batch: ForwardBatch,

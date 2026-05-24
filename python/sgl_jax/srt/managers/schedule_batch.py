@@ -404,6 +404,11 @@ class Req:
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        logger.info(
+            "init_next_round_input: rid=%s fill_ids_len=%d prefix_len=%d extend_len=%d",
+            getattr(self, 'rid', '?'), len(self.fill_ids),
+            len(self.prefix_indices), self.extend_input_len,
+        )
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
@@ -428,6 +433,10 @@ class Req:
             not self.kv_committed_freed
         ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
+        logger.info(
+            "pop_committed_kv_cache: rid=%s kv_committed_len=%d",
+            getattr(self, 'rid', '?'), self.kv_committed_len,
+        )
         return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> tuple[int, int]:
@@ -991,6 +1000,10 @@ class ScheduleBatch:
                 assert seq_len - pre_len == req.extend_input_len
 
                 req.kv_committed_len = seq_len
+                logger.info(
+                    "prepare_for_extend: rid=%s kv_committed_len=%d seq_len=%d fill_ids_len=%d",
+                    getattr(req, 'rid', '?'), req.kv_committed_len, seq_len, len(req.fill_ids),
+                )
                 req.kv_allocated_len = seq_len
                 req.cache_protected_len = pre_len
 

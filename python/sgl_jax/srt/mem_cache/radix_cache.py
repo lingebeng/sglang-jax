@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
@@ -159,8 +162,17 @@ class RadixCache(BasePrefixCache):
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = page_size
+        if is_eagle and page_size > 1:
+            self._allocator_page_size = page_size
+            self.page_size = 1
+        else:
+            self._allocator_page_size = page_size
+            self.page_size = page_size
         self.disable = disable
+        logger.info(
+            "RadixCache init: page_size=%d (allocator=%d) disable=%s is_eagle=%s",
+            self.page_size, self._allocator_page_size, disable, is_eagle,
+        )
         self.kv_head_num = kv_head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
@@ -211,6 +223,7 @@ class RadixCache(BasePrefixCache):
             key = RadixKey(key, extra_key, dp_rank)
 
         if self.disable or len(key) == 0:
+            logger.info("match_prefix: SKIP disabled=%s key_len=%d", self.disable, len(key))
             empty_array = np.empty((0,), dtype=np.int32)
 
             return MatchResult(
@@ -228,6 +241,13 @@ class RadixCache(BasePrefixCache):
             converted_key = converted_key[:page_aligned_len]
 
         token_sequences, last_node = self._match_prefix_helper(self.root_node, converted_key)
+        logger.info(
+            "match_prefix: raw_key_len=%d converted_len=%d n_children=%d "
+            "matched_seqs=%d extra_key=%s dp_rank=%s",
+            len(key), len(converted_key), len(self.root_node.children),
+            len(token_sequences) if token_sequences else 0,
+            key.extra_key, key.dp_rank,
+        )
 
         if token_sequences:
             valid_tokens = []
@@ -314,10 +334,18 @@ class RadixCache(BasePrefixCache):
 
         if is_insert:
             # Radix Cache takes over one reference from memory pool
+            insert_key = RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank)
+            logger.info(
+                "cache_finished_req: rid=%s token_ids=%s kv_indices=%s "
+                "extra_key=%s dp_rank=%s is_eagle=%s",
+                getattr(req, 'rid', '?'), token_ids[:page_aligned_token_len],
+                page_aligned_kv_indices, req.extra_key, req.dp_rank, self.is_eagle,
+            )
             new_prefix_len = self.insert(
-                RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
+                insert_key,
                 page_aligned_kv_indices,
             )
+            logger.info("cache_finished_req: new_prefix_len=%d", new_prefix_len)
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
             )
@@ -426,6 +454,10 @@ class RadixCache(BasePrefixCache):
             if dp_rank is not None and node_dp_rank != dp_rank:
                 continue
 
+            logger.info(
+                "evict: removing node with %d tokens, key=%s",
+                len(x.value), x.key[:5] if x.key else None,
+            )
             self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
             num_evicted += len(x.value)
             self._delete_leaf(x)

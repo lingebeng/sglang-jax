@@ -528,6 +528,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         if is_argus_active():
             advance_step(forward_batch)
+            from argus.jax import dump_tensor
+
+            dump_tensor("batch/input_ids", forward_batch.input_ids, "output")
+            if forward_batch.positions is not None:
+                dump_tensor("batch/positions", forward_batch.positions, "output")
+            if forward_batch.seq_lens is not None:
+                dump_tensor("batch/seq_lens", forward_batch.seq_lens, "output")
+            if forward_batch.out_cache_loc is not None:
+                dump_tensor("batch/out_cache_loc", forward_batch.out_cache_loc, "output")
+            if forward_batch.cache_loc is not None:
+                dump_tensor("batch/cache_loc", forward_batch.cache_loc, "output")
 
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)

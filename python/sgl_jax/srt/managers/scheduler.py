@@ -1372,12 +1372,29 @@ class Scheduler(
                 )
         else:
             size_per_rank = self.token_to_kv_pool_allocator.size_per_rank
+            # EAGLE radix cache uses page_size=1 (token-level) while the
+            # allocator may use page_size>1 (page-level).  The unused
+            # tail of each partially-occupied page is neither tracked by
+            # the tree nor returned to the allocator, so the strict
+            # equality avail+evict+protected==total will under-count.
+            # Accept avail+evict+protected <= total for EAGLE.
+            eagle_paged = (
+                getattr(self.tree_cache, '_allocator_page_size', 1)
+                > getattr(self.tree_cache, 'page_size', 1)
+            )
             leak_msgs = []
             for dp in range(self.dp_size):
                 avail = self.token_to_kv_pool_allocator.available_size(dp)
                 evict = self.tree_cache.evictable_size(dp_rank=dp)
                 protected = self.tree_cache.protected_size(dp_rank=dp)
-                if avail + evict + protected != size_per_rank:
+                total = avail + evict + protected
+                if eagle_paged:
+                    if total > size_per_rank:
+                        leak_msgs.append(
+                            f"[dp={dp}] expected<={size_per_rank}, "
+                            f"{avail=}, {evict=}, {protected=}"
+                        )
+                elif total != size_per_rank:
                     leak_msgs.append(
                         f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
                     )
