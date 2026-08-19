@@ -270,8 +270,9 @@ suites = {
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
         TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 0.2),
-        TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 0.2),
+        TestFile("python/sgl_jax/test/speculative/test_eagle_fused.py", 0.2),
+        TestFile("python/sgl_jax/test/speculative/test_relay_buffer.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/speculative/test_spec_overlap.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 0.5),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 0.1),
@@ -280,8 +281,9 @@ suites = {
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
+        TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
     ],
-    # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
+    # CPU-only unit tests — moved off the v6e-1 TPU runner to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
     # Python / numpy / mocks (no JAX device ops) or JAX kernels whose
     # header already pins JAX_PLATFORMS=cpu and which target CPU
@@ -306,6 +308,11 @@ suites = {
         ),
         TestFile(
             "python/sgl_jax/test/test_tp_worker_overlap_thread.py",
+            0.2,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/managers/test_future_token_map.py",
             0.2,
             runner="pytest",
         ),

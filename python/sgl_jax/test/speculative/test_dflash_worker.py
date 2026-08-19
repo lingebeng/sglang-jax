@@ -1,11 +1,18 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import jax
 import numpy as np
 
-from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
+from sgl_jax.srt.layers.attention.flashattention_metadata import (
+    PagedKVLayout,
+    build_target_verify_metadata,
+    pad_page_indices,
+)
+from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
 from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _bare_worker(**attrs):
@@ -13,6 +20,33 @@ def _bare_worker(**attrs):
     for k, v in attrs.items():
         object.__setattr__(w, k, v)
     return w
+
+
+def test_no_overlap_dflash_uses_explicit_fused_orchestration():
+    worker = object.__new__(BaseSpecWorker)
+    worker.server_args = SimpleNamespace(disable_overlap_schedule=True)
+    worker.speculative_algorithm = SpeculativeAlgorithm.DFLASH
+    worker._can_use_fused_eagle_verify = False
+    worker._get_cur_allocate_lens = Mock(return_value=np.array([16], dtype=np.int32))
+    worker._draft_worker = Mock()
+    batch_output = object()
+    worker._draft_worker.verify.return_value = batch_output
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: False),
+        launch_done=None,
+    )
+
+    result = worker.forward_batch_speculative_generation(batch, launch_done=Mock())
+
+    assert result is batch_output
+    worker._draft_worker.draft.assert_called_once_with(batch)
+    verify_batch, verify_allocate_lens = worker._draft_worker.verify.call_args.args
+    assert verify_batch is batch
+    np.testing.assert_array_equal(verify_allocate_lens, np.array([16], dtype=np.int32))
+    worker._draft_worker.draft_extend_for_decode.assert_called_once_with(
+        batch,
+        batch_output,
+    )
 
 
 def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():
@@ -55,30 +89,21 @@ def test_draft_extend_masks_unaccepted_and_padded_rows():
     )
 
 
-def test_verify_bucket_template_is_cached_by_active_slots():
-    mesh = jax.sharding.Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
-    worker = _bare_worker(
-        block_size=4,
-        mesh=mesh,
-        _verify_bucket_templates={},
-    )
-    mwb = SimpleNamespace(
+def test_verify_metadata_uses_explicit_active_slots():
+    metadata = build_target_verify_metadata(
+        PagedKVLayout(page_indices=jax.numpy.arange(32, dtype=jax.numpy.int32)),
+        prefix_lens=jax.numpy.array([4, 0, 0, 0], dtype=jax.numpy.int32),
+        allocated_lens=jax.numpy.array([8, 8, 8, 8], dtype=jax.numpy.int32),
+        active_mask=jax.numpy.array([True, True, False, False]),
+        draft_width=4,
+        page_size=1,
         dp_size=1,
-        per_dp_bs_size=4,
-        real_bs=2,
-        logits_indices_selector=np.array([0, 2], dtype=np.int32),
     )
 
-    first = worker._get_verify_bucket_template(mwb, bs=4)
-    second = worker._get_verify_bucket_template(mwb, bs=4)
-
-    assert first is second
-    np.testing.assert_array_equal(first.extend_seq_lens, np.array([4, 0, 4, 0]))
-    np.testing.assert_array_equal(np.asarray(first.cu_q_lens), np.array([0, 4, 4, 8, 8]))
-    np.testing.assert_array_equal(
-        np.asarray(first.active_mask), np.array([True, False, True, False])
-    )
-    np.testing.assert_array_equal(np.asarray(first.distribution), np.array([0, 2, 2]))
+    np.testing.assert_array_equal(np.asarray(metadata.cu_q_lens), np.array([0, 4, 8, 8, 8]))
+    np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 8, 12, 12, 12]))
+    np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([8, 4, 0, 0]))
+    np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 2, 2]))
 
 
 def test_build_page_indices_preserves_dp_rank_sections():
@@ -149,15 +174,13 @@ def test_build_page_indices_handles_uneven_dp_ranks():
     )
 
 
-def test_unpad_draft_state_removes_dp_padding_but_keeps_new_seq_lens():
+def test_unpad_draft_state_removes_dp_padding():
     di = DFlashDraftInput(
         verified_id=np.array([10, 20, 0, 30, 0, 0], dtype=np.int32),
         target_hidden=None,
         ctx_lens=np.array([1, 2, 0, 3, 0, 0], dtype=np.int32),
         draft_seq_lens=np.array([5, 6, 0, 7, 0, 0], dtype=np.int32),
     )
-    di.new_seq_lens = np.array([6, 8, 0, 10, 0, 0], dtype=np.int32)
-
     DFlashWorker._unpad_draft_state(
         di,
         np.array([0, 1, 3], dtype=np.int32),
@@ -166,7 +189,6 @@ def test_unpad_draft_state_removes_dp_padding_but_keeps_new_seq_lens():
     np.testing.assert_array_equal(di.verified_id, np.array([10, 20, 30], dtype=np.int32))
     np.testing.assert_array_equal(di.ctx_lens, np.array([1, 2, 3], dtype=np.int32))
     np.testing.assert_array_equal(di.draft_seq_lens, np.array([5, 6, 7], dtype=np.int32))
-    np.testing.assert_array_equal(di.new_seq_lens, np.array([6, 8, 0, 10, 0, 0]))
 
 
 def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():
@@ -265,7 +287,7 @@ def test_build_page_indices_reads_noncontiguous_physical_pages():
 def test_pad_page_indices_uses_fixed_dflash_capacity():
     page_indices = np.array([3, 5, 7], dtype=np.int32)
 
-    padded = _pad_page_indices(page_indices, max_num_seqs=2, fixed_capacity=8)
+    padded = pad_page_indices(page_indices, max_num_seqs=2, fixed_capacity=8)
 
     np.testing.assert_array_equal(
         padded,
@@ -275,7 +297,7 @@ def test_pad_page_indices_uses_fixed_dflash_capacity():
 
 def test_pad_page_indices_rejects_fixed_capacity_overflow():
     with np.testing.assert_raises_regex(ValueError, "exceed fixed capacity"):
-        _pad_page_indices(
+        pad_page_indices(
             np.arange(9, dtype=np.int32),
             max_num_seqs=2,
             fixed_capacity=8,

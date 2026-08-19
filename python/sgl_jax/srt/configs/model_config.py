@@ -50,6 +50,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeV2_5ForCausalLM",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
+        "GlmMoeDsaForCausalLM",
     }
 )
 
@@ -57,12 +58,20 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
 _FORCED_FUSED_EP_MOE_ARCHS = frozenset({"Qwen3_5MoeForConditionalGeneration"})
 
 
+def _get_llama_draft_architecture(speculative_algorithm: str | None) -> str:
+    return (
+        "LlamaForCausalLMEagle"
+        if (speculative_algorithm or "").upper() == "EAGLE"
+        else "LlamaForCausalLMEagle3"
+    )
+
+
 def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
     if moe_backend != MoEBackend.FUSED_V2:
         return
 
     assert any(arch in _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES for arch in architectures), (
-        "moe_backend='fused_v2' only supports Bailing/MiMo model architectures for now; "
+        "moe_backend='fused_v2' only supports Bailing/MiMo/GLM model architectures for now; "
         f"got architectures={architectures}"
     )
 
@@ -87,6 +96,7 @@ class ModelConfig:
         multimodal: bool = False,
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         model_sub_dir: str | None = None,
+        speculative_algorithm: str | None = None,
     ) -> None:
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
@@ -189,7 +199,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "LlamaForCausalLM":
-            self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
+            self.hf_config.architectures[0] = _get_llama_draft_architecture(speculative_algorithm)
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
@@ -557,6 +567,7 @@ class ModelConfig:
             revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
+            speculative_algorithm=server_args.speculative_algorithm,
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             dtype_config=server_args.dtype_config,

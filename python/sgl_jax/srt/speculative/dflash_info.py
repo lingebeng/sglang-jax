@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +9,13 @@ import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.speculative.spec_info import (
+    SpecConcatPolicy,
+    SpecDraftStateMixin,
+    SpecRelayPolicy,
+    SpecStateField,
+    SpecStateLayout,
+)
 
 
 def _mask_draft_kv_writes(
@@ -73,60 +81,38 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
-# TODO: Share greedy chain verification through common speculative helpers.
-def dflash_greedy_verify(
-    draft_token: jax.Array,
-    target_logits: jax.Array,
-    *,
-    draft_token_num: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Pure JAX target-logits argmax and greedy DFlash verification."""
-    candidates = draft_token.reshape((-1, int(draft_token_num)))
-    target_predict_flat = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
-    mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
-    if mesh is not None and getattr(mesh, "empty", False):
-        mesh = None
-    target_predict = target_predict_flat.reshape(candidates.shape)
-    if mesh is not None:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        data_2d = NamedSharding(mesh, P("data", None))
-        candidates = jax.sharding.reshard(candidates, data_2d)
-        target_predict = jax.sharding.reshard(target_predict, data_2d)
-
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    accept_len_draft = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
-    target_predict_flat = target_predict.reshape(-1).astype(jnp.int32)
-    if mesh is None:
-        bonus = jnp.take_along_axis(
-            target_predict,
-            accept_len_draft[:, None],
-            axis=1,
-        ).reshape(-1)
-    else:
-
-        def _select_local_bonus(local_predict, local_accept_len):
-            return jnp.take_along_axis(
-                local_predict,
-                local_accept_len[:, None],
-                axis=1,
-            ).reshape(-1)
-
-        bonus = jax.shard_map(
-            _select_local_bonus,
-            mesh=mesh,
-            in_specs=(P("data", None), P("data")),
-            out_specs=P("data"),
-        )(target_predict, accept_len_draft)
-
-    accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
-    return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
-
-
 @dataclass
-class DFlashDraftInput:
+class DFlashDraftInput(SpecDraftStateMixin):
     """Host-side DFlash state carried between decode iterations."""
+
+    STATE_LAYOUT: ClassVar[SpecStateLayout] = SpecStateLayout(
+        name="DFLASH",
+        fields=(
+            SpecStateField(
+                "verified_id",
+                relay=SpecRelayPolicy.DROP,
+                required_for_scatter=True,
+            ),
+            SpecStateField(
+                "target_hidden",
+                concat=SpecConcatPolicy.EMPTY_IS_NONE,
+            ),
+            SpecStateField(
+                "ctx_lens",
+                relay=SpecRelayPolicy.DROP,
+                required_for_scatter=True,
+            ),
+            SpecStateField(
+                "draft_seq_lens",
+                relay=SpecRelayPolicy.DROP,
+                required_for_scatter=True,
+            ),
+            SpecStateField("allocate_lens", relay=SpecRelayPolicy.KEEP),
+            SpecStateField("reservation_base_lens", relay=SpecRelayPolicy.KEEP),
+            SpecStateField("future_indices", relay=SpecRelayPolicy.KEEP),
+        ),
+        static_fields=("block_size",),
+    )
 
     verified_id: jax.Array | np.ndarray = None
     target_hidden: jax.Array | None = None
@@ -213,7 +199,7 @@ class DFlashDraftInput:
             alloc_paged_token_slots_extend,
             alloc_token_slots,
         )
-        from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
+        from sgl_jax.srt.speculative.spec_info import assign_req_to_token_pool
 
         block_size = self.block_size
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
@@ -432,7 +418,6 @@ class DFlashVerifyInput:
 
     draft_token: jax.Array
     draft_token_num: int
-    custom_mask = None
 
     def tree_flatten(self):
         return (self.draft_token,), {"draft_token_num": int(self.draft_token_num)}

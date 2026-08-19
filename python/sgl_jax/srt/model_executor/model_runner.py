@@ -211,6 +211,32 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # Static-quant checkpoints can leave jax.ShapeDtypeStruct placeholders
+        # in module state (e.g. the pre-quant weight slot of QuantizedLinear
+        # when the weight mapping targets .weight_q). jaxlib's ToPyArgSignature
+        # rejects ShapeDtypeStruct, so ComputeCallSignature fails and every
+        # jitted_run_model call falls back to the python dispatch path -- the
+        # per-decode-step cpp cache miss of #1452. The placeholders are dead
+        # on the forward path (a used leaf with a changed shape would fail to
+        # compile); swap them for zero-length arrays so the cpp fastpath can
+        # build a signature.
+        _sds_paths = []
+        _state_paths = None
+        for _i, _x in enumerate(self.model_state_leaves):
+            if isinstance(_x, jax.ShapeDtypeStruct):
+                if _state_paths is None:
+                    _state_paths = jax.tree_util.tree_flatten_with_path(model_state)[0]
+                _sds_paths.append(jax.tree_util.keystr(_state_paths[_i][0]))
+                self.model_state_leaves[_i] = jax.device_put(
+                    jnp.zeros((0,), dtype=_x.dtype), NamedSharding(self.mesh, P())
+                )
+        if _sds_paths:
+            logger.info(
+                "[model_runner] replaced %d ShapeDtypeStruct state placeholders "
+                "with empty arrays (pjit cpp fastpath, #1452); e.g. %s",
+                len(_sds_paths),
+                _sds_paths[:4],
+            )
         self._model_def = model_def
         self._model_state_def = model_state_def
         sampler_def, sampler_state = nnx.split(self.sampler)
@@ -375,7 +401,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             rng_step,
             sampling_metadata,
             future_token_ids_map,
-            future_token_ids_ct,
         ):
             # resolve_future_token_ids inlined: negative ids are future placeholders.
             ids = forward_batch.input_ids
@@ -407,11 +432,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=rng_key,
             )
-            # async_gather + set_future_token_ids inlined.
+            # async_gather + set_future_token_ids inlined. Per-request slot
+            # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
+            # of bounds and are dropped. See managers/utils.set_future_token_ids.
             next_ids = jax.lax.with_sharding_constraint(next_ids, NamedSharding(_fused_mesh, P()))
-            new_future_map = jax.lax.dynamic_update_slice(
-                future_token_ids_map, next_ids, (future_token_ids_ct + 1,)
+            slot_ids = jnp.where(
+                forward_batch.seq_lens > 0,
+                forward_batch.req_pool_indices.astype(jnp.int32) + 1,
+                jnp.int32(future_token_ids_map.shape[0]),
             )
+            slot_ids = jax.lax.with_sharding_constraint(slot_ids, NamedSharding(_fused_mesh, P()))
+            new_future_map = future_token_ids_map.at[slot_ids].set(next_ids, mode="drop")
             return (
                 next_ids,
                 output,
@@ -422,9 +453,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 new_future_map,
             )
 
-        def run_and_sample_wrapper(
-            forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
-        ):
+        def run_and_sample_wrapper(forward_batch, logits_metadata, sampling_metadata, future_map):
             self._sampler_step += 1
             return jitted_run_and_sample(
                 model_def,
@@ -440,7 +469,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 self._sampler_step,
                 sampling_metadata,
                 future_map,
-                jnp.asarray(future_ct, dtype=jnp.int32),
             )
 
         self.jitted_run_and_sample = run_and_sample_wrapper
@@ -748,9 +776,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
 
-    def forward_and_sample(
-        self, forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
-    ):
+    def forward_and_sample(self, forward_batch, logits_metadata, sampling_metadata, future_map):
         import jax._src.test_util as jtu
 
         self.forward_pass_id += 1
@@ -769,7 +795,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     token_logprobs,
                     new_future_map,
                 ) = self.jitted_run_and_sample(
-                    forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
+                    forward_batch, logits_metadata, sampling_metadata, future_map
                 )
                 cache_miss_count = count()
             if self.tp_size == 1 and isinstance(pool_updates, list):
