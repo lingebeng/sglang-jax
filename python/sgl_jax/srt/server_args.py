@@ -206,6 +206,7 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    enable_dspark_tuned_config: bool = False
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1487,7 +1488,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH", "DSPARK"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1535,6 +1536,15 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--enable-dspark-tuned-config",
+            action="store_true",
+            default=ServerArgs.enable_dspark_tuned_config,
+            help=(
+                "Enable the built-in DSpark STS/SPS tune table. An exact deployment-key "
+                "miss falls back to fixed verify-all serving."
+            ),
         )
 
         # For deterministic sampling
@@ -1862,6 +1872,9 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
+        if self.enable_dspark_tuned_config and self.speculative_algorithm != "DSPARK":
+            raise ValueError("--enable-dspark-tuned-config requires --speculative-algorithm DSPARK.")
+
         # Speculative overlap uses the fused NEXTN path or DFlash's dedicated
         # relay-backed draft/verify path.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
@@ -1870,10 +1883,10 @@ class ServerArgs:
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
-            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            supports_dflash_overlap = self.speculative_algorithm in ("DFLASH", "DSPARK")
             if not (supports_nextn_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH or NEXTN with "
+                    "Speculative overlap scheduler only supports DFLASH/DSPARK or NEXTN with "
                     "--speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
@@ -1899,31 +1912,101 @@ class ServerArgs:
                 or str(arg).startswith("--speculative-num-draft-tokens=")
                 for arg in explicit_cli_args
             )
-            if (
-                not explicit_draft_tokens
-                and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
-            ):
-                from sgl_jax.srt.speculative.dflash_util import (
-                    parse_dflash_draft_config,
-                )
+            from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
 
-                draft_config = parse_dflash_draft_config(
-                    self.speculative_draft_model_path,
-                    revision=self.speculative_draft_model_revision,
-                    trust_remote_code=self.trust_remote_code,
-                )
-                if draft_config.block_size != self.speculative_num_draft_tokens:
-                    logger.info(
-                        "DFLASH: using draft config block_size=%d for "
-                        "--speculative-num-draft-tokens (default was %d).",
-                        draft_config.block_size,
-                        self.speculative_num_draft_tokens,
+            draft_config = parse_dflash_draft_config(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision,
+                trust_remote_code=self.trust_remote_code,
+            )
+            widths_already_normalized = bool(getattr(self, "_dflash_widths_normalized", False))
+            if explicit_draft_tokens and not widths_already_normalized:
+                if self.speculative_num_draft_tokens != draft_config.block_size:
+                    raise ValueError(
+                        "DFLASH --speculative-num-draft-tokens must match checkpoint "
+                        f"block_size={draft_config.block_size}, got "
+                        f"{self.speculative_num_draft_tokens}."
                     )
-                    self.speculative_num_draft_tokens = draft_config.block_size
+            elif (
+                not widths_already_normalized
+                and self.speculative_num_draft_tokens != ServerArgs.speculative_num_draft_tokens
+                and self.speculative_num_draft_tokens != draft_config.block_size
+            ):
+                # Preserve programmatic callers that explicitly supplied a
+                # non-default width even though they have no CLI provenance.
+                raise ValueError(
+                    "DFLASH speculative_num_draft_tokens must match checkpoint "
+                    f"block_size={draft_config.block_size}, got "
+                    f"{self.speculative_num_draft_tokens}."
+                )
+            self.speculative_num_draft_tokens = draft_config.verify_width
+            self._dflash_widths_normalized = True
+            logger.info(
+                "DFLASH %s checkpoint: block_size=%d, draft_width=%d, verify_width=%d.",
+                draft_config.dialect,
+                draft_config.block_size,
+                draft_config.draft_width,
+                draft_config.verify_width,
+            )
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):
                 raise ValueError("DFLASH does not support constrained decoding.")
+
+        # DSPARK: seven semi-AR proposals and a maximum verify window of anchor + gamma.
+        if self.speculative_algorithm == "DSPARK":
+            if self.tp_size < 1:
+                raise ValueError("DSPARK requires --tp-size>=1.")
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "DSPARK requires --speculative-eagle-topk=1 (linear chain, no tree)."
+                )
+            if self.speculative_num_steps != 1:
+                raise ValueError("DSPARK stage1 requires --speculative-num-steps=1.")
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DSPARK requires --speculative-draft-model-path (the DSpark draft)."
+                )
+
+            from sgl_jax.srt.speculative.dspark_util import parse_dspark_draft_config
+
+            draft_config = parse_dspark_draft_config(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision,
+                trust_remote_code=self.trust_remote_code,
+            )
+            explicit_cli_args = getattr(self, "_explicit_cli_args", set())
+            explicit_draft_tokens = any(
+                str(arg) == "--speculative-num-draft-tokens"
+                or str(arg).startswith("--speculative-num-draft-tokens=")
+                for arg in explicit_cli_args
+            )
+            widths_already_normalized = bool(getattr(self, "_dspark_widths_normalized", False))
+            if (
+                explicit_draft_tokens
+                and not widths_already_normalized
+                and self.speculative_num_draft_tokens != draft_config.gamma
+            ):
+                raise ValueError(
+                    "DSPARK --speculative-num-draft-tokens denotes gamma and must match "
+                    f"checkpoint block_size={draft_config.gamma}, got "
+                    f"{self.speculative_num_draft_tokens}."
+                )
+            # Existing scheduler/allocator plumbing counts target verify rows,
+            # which include the anchor. Preserve the CLI's proposal-count meaning
+            # while normalizing the internal value to gamma + 1.
+            self.speculative_num_draft_tokens = draft_config.verify_width
+            self._dspark_widths_normalized = True
+            logger.info(
+                "DSPARK: gamma=%d, draft_width=%d, max_verify_width=%d.",
+                draft_config.gamma,
+                draft_config.draft_width,
+                draft_config.verify_width,
+            )
+            if self.enable_lora or self.enable_static_lora or self.lora_paths:
+                raise ValueError("DSPARK does not support LoRA.")
+            if self.grammar_backend not in (None, "none"):
+                raise ValueError("DSPARK does not support constrained decoding.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

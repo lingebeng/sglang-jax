@@ -421,6 +421,7 @@ class SchedulerOutputProcessorMixin:
             self.num_generated_tokens += batch.batch_size()
         else:
             active_spec_reqs = 0
+            accepted_spec_tokens = 0
             per_dp_bs = batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 base = dp_rank * per_dp_bs
@@ -432,9 +433,12 @@ class SchedulerOutputProcessorMixin:
                     accepted = len(next_token_ids[base + j])
                     self.num_generated_tokens += accepted
                     self.accept_token += accepted
+                    accepted_spec_tokens += accepted
                     active_spec_reqs += 1
             self.spec_num_forward_ct += active_spec_reqs
             self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
+            self.spec_num_total_accepted_tokens += accepted_spec_tokens
+            self.spec_num_total_forward_ct += active_spec_reqs
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
@@ -491,7 +495,7 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = 1
                 if not is_spec_decode:
                     req.output_ids.append(next_token_id)
-                elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash():
+                elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
 
@@ -517,7 +521,7 @@ class SchedulerOutputProcessorMixin:
                     )
                 elif (
                     is_spec_decode
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
                     and not legacy_eagle3_non_overlap
                 ):
                     req.kv_committed_len += new_accepted_len - 1

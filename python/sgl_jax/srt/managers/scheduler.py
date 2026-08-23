@@ -406,10 +406,15 @@ class Scheduler(
             )
             if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
                 self.draft_worker.init_spec_relay_buffers()
-        elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
-            from sgl_jax.srt.speculative.dflash_worker import (
-                DFlashWorker as _SpecWorkerCls,
-            )
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash_family():
+            if self.spec_algorithm.is_dspark():
+                from sgl_jax.srt.speculative.dspark_worker import (
+                    DSparkWorker as _SpecWorkerCls,
+                )
+            else:
+                from sgl_jax.srt.speculative.dflash_worker import (
+                    DFlashWorker as _SpecWorkerCls,
+                )
 
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
@@ -1339,7 +1344,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
+        if self.spec_algorithm is not None and self.spec_algorithm.is_dflash_family():
             dflash_err = validate_dflash_request(req)
             if dflash_err is not None:
                 req.set_finish_with_abort(dflash_err)
@@ -1464,6 +1469,13 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["spec_num_total_accepted_tokens"] = self.spec_num_total_accepted_tokens
+        ret["spec_num_total_forward_ct"] = self.spec_num_total_forward_ct
+        ret["spec_avg_accept_length"] = (
+            self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+            if self.spec_num_total_forward_ct > 0
+            else 0.0
+        )
         ret["memory_usage"] = {
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
@@ -1515,6 +1527,11 @@ class Scheduler(
         # counters
         ret["num_generated_tokens"] = self.num_generated_tokens
         ret["forward_ct_decode"] = self.forward_ct_decode
+        if self.step_time_dict:
+            ret["decode_step_time_by_batch_size"] = {
+                str(batch_size): list(step_times)
+                for batch_size, step_times in self.step_time_dict.items()
+            }
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
 
@@ -2509,7 +2526,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2524,7 +2541,7 @@ class Scheduler(
         )
         if (
             self.spec_algorithm is not None
-            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
             and batch_output.next_draft_input is not None
         ):
             assert isinstance(batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput))
