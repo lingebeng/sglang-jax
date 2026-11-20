@@ -635,6 +635,16 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         """Construct the persistent Frozen-KV state owned by this worker."""
         return self.draft_input_cls(**kwargs)
 
+    def model_forward_spec_info(
+        self, spec_info: FrozenKvMtpDraftInput
+    ) -> FrozenKvMtpDraftInput:
+        """Keep scheduler-only relay state out of the fused draft JIT key."""
+        return self.new_draft_input(
+            hidden_states=spec_info.hidden_states,
+            allocate_lens=spec_info.allocate_lens,
+            capture_hidden_mode=spec_info.capture_hidden_mode,
+        )
+
     @property
     def draft_model_runner(self):
         return self._worker.get_model_runner()
@@ -1078,6 +1088,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
             model_worker_batch
         )
         forward_batch = _make_forward_batch(model_worker_batch, runner)
+        forward_batch.spec_info = self.model_forward_spec_info(forward_batch.spec_info)
         forward_batch.bid = model_worker_batch.bid
         logits_metadata = _prepare_logits_metadata(model_worker_batch, self.mesh)
         data_sharding = NamedSharding(self.mesh, P("data"))

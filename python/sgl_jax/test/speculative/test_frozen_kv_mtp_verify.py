@@ -12,6 +12,7 @@ import pytest
 
 from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 from sgl_jax.srt.speculative.frozen_kv_mtp_worker import (
+    FrozenKvMtpDraftInput,
     FrozenKvMtpDraftWorker,
     FrozenKvMtpWorker,
     _build_frozen_kv_fused_draft_extend,
@@ -92,6 +93,37 @@ def test_fused_draft_selects_seed_output_only_for_live_rows():
 def test_fused_draft_builder_has_stable_profile_name():
     """The TPU trace exposes the reviewer-requested top-level dispatch name."""
     assert _build_frozen_kv_fused_draft_extend(3).__name__ == "draft_extend_fused"
+
+
+def test_fused_draft_jit_key_ignores_scheduler_only_accept_state():
+    """Post-prefill and post-verify descriptors must share one JIT signature."""
+    worker = FrozenKvMtpDraftWorker.__new__(FrozenKvMtpDraftWorker)
+    common = {
+        "hidden_states": np.zeros((16, 8), dtype=np.float32),
+        "allocate_lens": np.full((16,), 1024, dtype=np.int32),
+    }
+    post_prefill = FrozenKvMtpDraftInput(
+        **common,
+        new_seq_lens=np.full((16,), 1024, dtype=np.int32),
+    )
+    post_verify = FrozenKvMtpDraftInput(
+        **common,
+        new_seq_lens=np.full((16,), 1028, dtype=np.int32),
+        accept_length_cpu=np.full((16,), 3, dtype=np.int32),
+    )
+
+    prefill_leaves, prefill_tree = jax.tree_util.tree_flatten(
+        worker.model_forward_spec_info(post_prefill)
+    )
+    verify_leaves, verify_tree = jax.tree_util.tree_flatten(
+        worker.model_forward_spec_info(post_verify)
+    )
+
+    assert prefill_tree == verify_tree
+    assert [np.shape(x) for x in prefill_leaves] == [np.shape(x) for x in verify_leaves]
+    projected = worker.model_forward_spec_info(post_verify)
+    assert projected.accept_length_cpu is None
+    assert projected.new_seq_lens is None
 
 
 def test_relay_padding_preserves_dp_segments():
