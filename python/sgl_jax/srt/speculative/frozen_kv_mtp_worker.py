@@ -12,6 +12,7 @@ EAGLE branch, rather than folding it into the multi-layer (per-MTP-head) worker.
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from functools import partial
@@ -33,9 +34,13 @@ from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
 from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
 from sgl_jax.srt.speculative.frozen_kv_mtp_seed import verify_frozen_kv_mtp_chain_greedy
 from sgl_jax.srt.speculative.relay_buffer import (
+    SpecRelayBuffers,
     SpecSeedRelayBuffers,
+    create_spec_relay_buffers,
     create_spec_seed_relay_buffers,
+    gather_spec_relay_buffers,
     gather_spec_seed_relay_buffers,
+    update_spec_relay_buffers,
     update_spec_seed_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -276,8 +281,8 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
 
     @partial(
         jax.jit,
-        donate_argnames=("memory_pools",),
-        static_argnames=("model_state_def", "num_steps", "dp_size"),
+        donate_argnames=("memory_pools", "proposal_relay_buffers"),
+        static_argnames=("model_state_def", "num_steps", "dp_size", "advance_seq_lens"),
     )
     def draft_extend_fused(
         model_def,
@@ -287,11 +292,16 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         memory_pools,
         logits_metadata,
         seed_relay_buffers,
+        proposal_relay_buffers,
         relay_future_indices,
-        relay_seed_mask,
+        relay_valid_mask,
+        draft_seq_lens,
+        draft_allocate_lens,
+        accept_lens,
         *,
         num_steps: int,
         dp_size: int,
+        advance_seq_lens: bool,
     ):
         state = jax.tree_util.tree_unflatten(model_state_def, model_leaves)
         model = nnx.merge(model_def, state)
@@ -299,14 +309,21 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         # target prefix on device and reuse it for the seed call and every
         # recurrent proposal. Allocated-but-uncommitted rows must never become
         # visible merely because the draft depth advances.
+        if advance_seq_lens:
+            draft_seq_lens = jnp.where(
+                relay_valid_mask,
+                draft_seq_lens + accept_lens + 1,
+                jnp.zeros_like(draft_seq_lens),
+            )
         frozen_metadata = _make_eagle3_decode_metadata(
             forward_batch.attn_backend.forward_metadata,
-            forward_batch.seq_lens,
-            forward_batch.spec_info.allocate_lens,
+            draft_seq_lens,
+            draft_allocate_lens,
             page_size=forward_batch.attn_backend.page_size,
             dp_size=dp_size,
         )
-        frozen_positions = _frozen_kv_positions(forward_batch.seq_lens)
+        frozen_positions = _frozen_kv_positions(draft_seq_lens)
+        forward_batch.seq_lens = draft_seq_lens
         forward_batch.positions = frozen_positions
         forward_batch.attn_backend.forward_metadata = frozen_metadata
         (
@@ -334,7 +351,7 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         token, hidden = _select_frozen_kv_proposal_start(
             relay_draft_token,
             relay_hidden,
-            relay_seed_mask,
+            relay_valid_mask,
             output.next_token_logits,
             output.hidden_states,
         )
@@ -367,9 +384,19 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         packed = build_chain_verify_inputs_device(
             relay_verified_id,
             token_list,
-            forward_batch.seq_lens - 1,
+            draft_seq_lens - 1,
             num_steps + 1,
             padded_bs,
+        )
+        updated_proposal_relay_buffers = update_spec_relay_buffers(
+            proposal_relay_buffers,
+            relay_future_indices,
+            relay_valid_mask,
+            token_list,
+            relay_hidden,
+            relay_verified_id,
+            draft_seq_lens,
+            dp_size=dp_size,
         )
         return (
             pool_updates,
@@ -378,9 +405,39 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
             packed[2].reshape(padded_bs, num_steps + 1),
             packed[3].reshape(padded_bs, num_steps + 1),
             packed[4].reshape(padded_bs, num_steps + 1),
+            updated_proposal_relay_buffers,
         )
 
     return draft_extend_fused
+
+
+def _build_frozen_kv_restore_proposal():
+    """Gather a previously prepared proposal chain without running the assistant."""
+
+    @partial(jax.jit, static_argnames=("num_steps", "dp_size"))
+    def restore(proposal_relay_buffers, relay_future_indices, *, num_steps: int, dp_size: int):
+        token_list, _hidden, verified_id, new_seq_lens = gather_spec_relay_buffers(
+            proposal_relay_buffers,
+            relay_future_indices,
+            dp_size=dp_size,
+        )
+        padded_bs = relay_future_indices.shape[0]
+        packed = build_chain_verify_inputs_device(
+            verified_id,
+            token_list,
+            new_seq_lens - 1,
+            num_steps + 1,
+            padded_bs,
+        )
+        return (
+            packed[0],
+            packed[1],
+            packed[2].reshape(padded_bs, num_steps + 1),
+            packed[3].reshape(padded_bs, num_steps + 1),
+            packed[4].reshape(padded_bs, num_steps + 1),
+        )
+
+    return restore
 
 
 @register_pytree_node_class
@@ -404,6 +461,10 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
     # needed before the next static scheduler bucket is selected: true rows
     # contain valid target token/hidden seeds; false rows are padded slots.
     relay_seed_mask: np.ndarray | None = None
+    # True rows already have their full next-round proposal chain in the
+    # request-indexed proposal relay. A mixed batch falls back to recomputing
+    # every row so newly admitted prefills and running decodes stay aligned.
+    relay_proposal_mask: np.ndarray | None = None
     # Upstream EAGLE no longer carries this legacy overlap relay handle. Frozen
     # keeps the explicit sentinel so its non-overlap state validation can reject
     # an accidental mixed lifecycle before a batch is merged or filtered.
@@ -424,18 +485,20 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
                 self.allocate_lens,
                 self.new_seq_lens,
                 self.relay_seed_mask,
+                self.relay_proposal_mask,
             ),
             aux_data,
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        # ``tree_flatten`` appends three Frozen-only children after the base
+        # ``tree_flatten`` appends four Frozen-only children after the base
         # EAGLE state.  Pass exactly the base children back to its unflattener.
-        obj = EagleDraftInput.tree_unflatten.__func__(cls, aux_data, children[:-3])
-        obj.allocate_lens = children[-3]
-        obj.new_seq_lens = children[-2]
-        obj.relay_seed_mask = children[-1]
+        obj = EagleDraftInput.tree_unflatten.__func__(cls, aux_data, children[:-4])
+        obj.allocate_lens = children[-4]
+        obj.new_seq_lens = children[-3]
+        obj.relay_seed_mask = children[-2]
+        obj.relay_proposal_mask = children[-1]
         obj.pending_draft_extend_result = None
         return obj
 
@@ -473,13 +536,14 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
             ]
             if unexpected:
                 raise ValueError(
-                    "Frozen-KV MTP relay state must not retain model tensors: " f"{unexpected}."
+                    f"Frozen-KV MTP relay state must not retain model tensors: {unexpected}."
                 )
             for field in (
                 "allocate_lens",
                 "new_seq_lens",
                 "accept_length_cpu",
                 "relay_seed_mask",
+                "relay_proposal_mask",
             ):
                 value = getattr(self, field, None)
                 if value is not None and np.asarray(value).shape[0] != batch_size:
@@ -531,6 +595,14 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
                     else np.asarray(new_indices, dtype=np.int32)
                 )
                 self.relay_seed_mask = src[idx]
+            if self.relay_proposal_mask is not None:
+                src = np.asarray(self.relay_proposal_mask)
+                idx = (
+                    slice(0, len(new_indices))
+                    if has_been_filtered and len(new_indices) == len(src)
+                    else np.asarray(new_indices, dtype=np.int32)
+                )
+                self.relay_proposal_mask = src[idx]
             super().filter_batch(new_indices, has_been_filtered)
             self._validate_non_overlap_state()
             return
@@ -553,6 +625,8 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
             super().trim_to_length(n)
             if self.relay_seed_mask is not None:
                 self.relay_seed_mask = np.asarray(self.relay_seed_mask, dtype=bool)[:n]
+            if self.relay_proposal_mask is not None:
+                self.relay_proposal_mask = np.asarray(self.relay_proposal_mask, dtype=bool)[:n]
             self._validate_non_overlap_state()
             return
 
@@ -586,6 +660,17 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
             if left_mask is not None:
                 self.relay_seed_mask = np.concatenate(
                     [np.asarray(left_mask, dtype=bool), np.asarray(right_mask, dtype=bool)]
+                )
+            left_ready = self.relay_proposal_mask
+            right_ready = other.relay_proposal_mask
+            if (left_ready is None) != (right_ready is None):
+                raise ValueError(
+                    "Frozen-KV proposal relay merge requires relay_proposal_mask on "
+                    "both sides or neither."
+                )
+            if left_ready is not None:
+                self.relay_proposal_mask = np.concatenate(
+                    [np.asarray(left_ready, dtype=bool), np.asarray(right_ready, dtype=bool)]
                 )
             self._validate_non_overlap_state()
             return
@@ -721,8 +806,11 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         # that buffer selects the generic overlap/fused execution path, which
         # Frozen-KV intentionally does not implement.
         self.seed_relay_buffers: SpecSeedRelayBuffers | None = None
+        self.proposal_relay_buffers: SpecRelayBuffers | None = None
         self._jit_publish_seed_relay = None
         self._jit_publish_prefill_seed_relay = None
+        self._frozen_kv_restore_proposal_jit_fn = None
+        self._pending_cache_miss_count = 0
 
         (
             self.precompile_token_paddings,
@@ -737,17 +825,30 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         selection stay in ``ScheduleBatch``.  The buffer is separate from the
         generic overlap relay because Frozen-KV's normal path is non-overlap.
         """
-        if getattr(self, "seed_relay_buffers", None) is not None:
+        if (
+            getattr(self, "seed_relay_buffers", None) is not None
+            and getattr(self, "proposal_relay_buffers", None) is not None
+        ):
             return
         hidden_dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
         req_to_token_pool, _ = self.target_worker_ref.get_memory_pool()
-        self.seed_relay_buffers = create_spec_seed_relay_buffers(
-            self.mesh,
-            req_to_token_pool,
-            dp_size=self.server_args.dp_size,
-            hidden_size=self.target_worker_ref.model_config.hidden_size,
-            hidden_dtype=hidden_dtype,
-        )
+        if getattr(self, "seed_relay_buffers", None) is None:
+            self.seed_relay_buffers = create_spec_seed_relay_buffers(
+                self.mesh,
+                req_to_token_pool,
+                dp_size=self.server_args.dp_size,
+                hidden_size=self.target_worker_ref.model_config.hidden_size,
+                hidden_dtype=hidden_dtype,
+            )
+        if getattr(self, "proposal_relay_buffers", None) is None:
+            self.proposal_relay_buffers = create_spec_relay_buffers(
+                self.mesh,
+                req_to_token_pool,
+                dp_size=self.server_args.dp_size,
+                num_steps=self.speculative_num_steps,
+                hidden_size=self.target_worker_ref.model_config.hidden_size,
+                hidden_dtype=hidden_dtype,
+            )
 
     def _init_jit_seed_relay_ops(self) -> None:
         """Create generic bucketed device programs for Frozen relay state.
@@ -971,6 +1072,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
             allocate_lens=seq_lens.copy(),
             new_seq_lens=seq_lens.copy(),
             relay_seed_mask=np.ones((selector.size,), dtype=bool),
+            relay_proposal_mask=np.zeros((selector.size,), dtype=bool),
         )
         model_worker_batch.spec_info_padded._validate_non_overlap_state()
         model_worker_batch.return_hidden_states = False
@@ -1019,13 +1121,179 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
             and state.future_indices is not None
             and state.relay_seed_mask is not None
             and self.seed_relay_buffers is not None
+            and self.proposal_relay_buffers is not None
             and hasattr(runner, "_model_def")
             and hasattr(runner, "_model_state_def")
         )
 
+    def _can_restore_prepared_proposal(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        state = model_worker_batch.spec_info_padded
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        proposal_mask = (
+            None if not isinstance(state, FrozenKvMtpDraftInput) else state.relay_proposal_mask
+        )
+        return (
+            isinstance(state, FrozenKvMtpDraftInput)
+            and state.future_indices is not None
+            and proposal_mask is not None
+            and selector.size > 0
+            and bool(np.all(np.asarray(proposal_mask, dtype=bool)[selector]))
+            and self.proposal_relay_buffers is not None
+        )
+
+    def _restore_prepared_proposal(self, model_worker_batch: ModelWorkerBatch) -> None:
+        """Restore the chain enqueued after the previous target verification."""
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _count_pjit_cpp_cache_miss,
+            _prepare_device_array,
+        )
+        from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
+
+        state = model_worker_batch.spec_info_padded
+        assert isinstance(state, FrozenKvMtpDraftInput)
+        relay_future_indices = np.asarray(state.future_indices, dtype=np.int32)
+        relay_seed_mask = np.asarray(state.relay_seed_mask, dtype=bool)
+        compact_bs = relay_future_indices.shape[0]
+        hidden_size = self.target_worker_ref.model_config.hidden_size
+        state.verified_id = np.empty((compact_bs,), dtype=np.int32)
+        state.topk_index = np.empty((compact_bs, 1), dtype=np.int32)
+        state.topk_p = np.empty((compact_bs, 1), dtype=np.float32)
+        state.hidden_states = np.empty((compact_bs, hidden_size), dtype=np.float32)
+        state.future_indices = None
+        state.relay_seed_mask = None
+        state.relay_proposal_mask = None
+        self.padding_for_decode(model_worker_batch)
+
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        dp_size = int(model_worker_batch.dp_size)
+        relay_future_indices = self._pad_relay_rows_for_bucket(
+            relay_future_indices,
+            padded_bs=padded_bs,
+            dp_size=dp_size,
+        )
+        relay_seed_mask = self._pad_relay_rows_for_bucket(
+            relay_seed_mask,
+            padded_bs=padded_bs,
+            dp_size=dp_size,
+            fill_value=False,
+        )
+        safe_indices = np.where(relay_seed_mask, relay_future_indices, 0)
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        safe_indices = _prepare_device_array(
+            safe_indices,
+            data_sharding,
+            "frozen_restore.relay_future_indices",
+        )
+        if self._frozen_kv_restore_proposal_jit_fn is None:
+            self._frozen_kv_restore_proposal_jit_fn = _build_frozen_kv_restore_proposal()
+        with jax.set_mesh(self.mesh), _count_pjit_cpp_cache_miss() as count:
+            draft_tokens, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
+                self._frozen_kv_restore_proposal_jit_fn(
+                    self.proposal_relay_buffers,
+                    safe_indices,
+                    num_steps=self.speculative_num_steps,
+                    dp_size=dp_size,
+                )
+            )
+            self._pending_cache_miss_count += count()
+        model_worker_batch.spec_info_padded = EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=None,
+            positions=positions,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            spec_steps=self.speculative_num_steps,
+            draft_token_num=self.speculative_num_draft_tokens,
+        )
+
+    def prepare_draft_after_verify(self, model_worker_batch, cur_allocate_lens):
+        """Prepare static launch inputs while target verification is still enqueueing."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _make_forward_batch,
+            _prepare_device_array,
+            _prepare_logits_metadata,
+        )
+
+        draft_batch = copy.copy(model_worker_batch)
+        draft_batch.forward_mode = ForwardMode.DECODE
+        runner = self.draft_model_runner
+        runner.attn_backend.forward_metadata = runner.attn_backend.get_eagle_base_metadata(
+            draft_batch
+        )
+        forward_batch = _make_forward_batch(draft_batch, runner)
+        forward_batch.bid = model_worker_batch.bid
+        logits_metadata = _prepare_logits_metadata(draft_batch, self.mesh)
+
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
+        allocate_lens[selector] = np.asarray(cur_allocate_lens, dtype=np.int32)
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        allocate_lens = _prepare_device_array(
+            allocate_lens,
+            data_sharding,
+            "frozen_draft_after_verify.allocate_lens",
+        )
+        return forward_batch, logits_metadata, allocate_lens
+
+    def launch_draft_after_verify(
+        self,
+        prepared_launch,
+        accept_lens,
+        relay_future_indices,
+        relay_valid_mask,
+    ) -> int:
+        """Enqueue the next proposal chain before acceptance reaches the host."""
+        from sgl_jax.srt.speculative.draft_extend_fused import _count_pjit_cpp_cache_miss
+
+        runner = self.draft_model_runner
+        forward_batch, logits_metadata, allocate_lens = prepared_launch
+        if not hasattr(self, "_frozen_kv_fused_draft_jit_fn"):
+            self._frozen_kv_fused_draft_jit_fn = _build_frozen_kv_fused_draft_extend(
+                self.speculative_num_steps
+            )
+        with jax.set_mesh(self.mesh), _count_pjit_cpp_cache_miss() as count:
+            (
+                pool_updates,
+                _draft_tokens,
+                _positions,
+                _retrive_index,
+                _retrive_next_token,
+                _retrive_next_sibling,
+                updated_proposal_relay_buffers,
+            ) = self._frozen_kv_fused_draft_jit_fn(
+                runner._model_def,
+                runner._model_state_def,
+                tuple(runner.model_state_leaves),
+                forward_batch,
+                runner.memory_pools,
+                logits_metadata,
+                self.seed_relay_buffers,
+                self.proposal_relay_buffers,
+                relay_future_indices,
+                relay_valid_mask,
+                forward_batch.seq_lens,
+                allocate_lens,
+                accept_lens,
+                num_steps=self.speculative_num_steps,
+                dp_size=int(self.server_args.dp_size),
+                advance_seq_lens=True,
+            )
+            cache_miss_count = count()
+        runner.memory_pools.replace_all(pool_updates)
+        self.proposal_relay_buffers = updated_proposal_relay_buffers
+        return cache_miss_count
+
+    def take_pending_cache_miss_count(self) -> int:
+        count = int(getattr(self, "_pending_cache_miss_count", 0))
+        self._pending_cache_miss_count = 0
+        return count
+
     def _draft_fused_linear_chain(self, model_worker_batch: ModelWorkerBatch) -> None:
         """Produce and pack the Frozen top-1 chain in one TPU dispatch."""
         from sgl_jax.srt.speculative.draft_extend_fused import (
+            _count_pjit_cpp_cache_miss,
             _make_forward_batch,
             _prepare_device_array,
             _prepare_logits_metadata,
@@ -1054,6 +1322,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         state.hidden_states = np.empty((compact_bs, hidden_size), dtype=np.float32)
         state.future_indices = None
         state.relay_seed_mask = None
+        state.relay_proposal_mask = None
         self.padding_for_decode(model_worker_batch)
 
         padded_bs = int(model_worker_batch.seq_lens.shape[0])
@@ -1096,7 +1365,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_steps
             )
 
-        with jax.set_mesh(self.mesh):
+        with jax.set_mesh(self.mesh), _count_pjit_cpp_cache_miss() as count:
             (
                 pool_updates,
                 draft_tokens,
@@ -1104,6 +1373,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
                 retrive_index,
                 retrive_next_token,
                 retrive_next_sibling,
+                updated_proposal_relay_buffers,
             ) = self._frozen_kv_fused_draft_jit_fn(
                 runner._model_def,
                 runner._model_state_def,
@@ -1112,13 +1382,20 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
                 runner.memory_pools,
                 logits_metadata,
                 self.seed_relay_buffers,
+                self.proposal_relay_buffers,
                 relay_future_indices,
                 relay_seed_mask,
+                forward_batch.seq_lens,
+                forward_batch.spec_info.allocate_lens,
+                jnp.zeros_like(forward_batch.seq_lens),
                 num_steps=self.speculative_num_steps,
                 dp_size=dp_size,
+                advance_seq_lens=False,
             )
+            self._pending_cache_miss_count += count()
 
         runner.memory_pools.replace_all(pool_updates)
+        self.proposal_relay_buffers = updated_proposal_relay_buffers
         model_worker_batch.spec_info_padded = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=None,
@@ -1132,6 +1409,8 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, model_worker_batch):
         """Run the only supported Frozen proposal path as one TPU dispatch."""
+        if self._can_restore_prepared_proposal(model_worker_batch):
+            return self._restore_prepared_proposal(model_worker_batch)
         if not self._can_use_fused_draft(model_worker_batch):
             raise RuntimeError(
                 "Frozen-KV MTP requires its fused top-1 linear draft path; "
@@ -1247,6 +1526,7 @@ class FrozenKvMtpWorker(EAGLEWorker):
             allocate_lens=allocate_lens,
             new_seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32)[selector],
             relay_seed_mask=np.ones(selector.shape, dtype=bool),
+            relay_proposal_mask=np.zeros(selector.shape, dtype=bool),
         )
 
     def _verify_fused_linear_chain(
@@ -1285,6 +1565,10 @@ class FrozenKvMtpWorker(EAGLEWorker):
             data_sharding,
             "frozen_verify.relay_valid_mask",
         )
+        prepared_draft_launch = self.draft_worker.prepare_draft_after_verify(
+            model_worker_batch,
+            cur_allocate_lens,
+        )
         if not hasattr(self, "_frozen_kv_fused_verify_jit_fn"):
             self._frozen_kv_fused_verify_jit_fn = _build_frozen_kv_fused_verify()
 
@@ -1314,10 +1598,19 @@ class FrozenKvMtpWorker(EAGLEWorker):
 
         target_mr.memory_pools.replace_all(target_pool_updates)
         self.draft_worker.seed_relay_buffers = updated_seed_relay_buffers
+        draft_cache_miss_count = self.draft_worker.launch_draft_after_verify(
+            prepared_draft_launch,
+            accept_lengths_device,
+            relay_future_indices,
+            relay_valid_mask,
+        )
+        cache_miss_count += draft_cache_miss_count
+        cache_miss_count += self.draft_worker.take_pending_cache_miss_count()
         model_worker_batch.positions = selected_positions
 
-        # The scheduler must inspect accepted lengths to commit output tokens;
-        # this compact vector is the sole mandatory device-to-host boundary.
+        # The next proposal is already queued through the device relay. The
+        # scheduler still needs accepted lengths to commit output tokens, but
+        # that host boundary is no longer between target verify and draft.
         if hasattr(accept_lengths_device, "copy_to_host_async"):
             accept_lengths_device.copy_to_host_async()
         accept_padded = np.asarray(accept_lengths_device, dtype=np.int32).reshape(-1)
@@ -1340,6 +1633,7 @@ class FrozenKvMtpWorker(EAGLEWorker):
             new_seq_lens=seq_lens[selector] + accept_live + 1,
             accept_length_cpu=accept_live.copy(),
             relay_seed_mask=np.ones((selector.size,), dtype=bool),
+            relay_proposal_mask=np.ones((selector.size,), dtype=bool),
         )
         next_draft_input._validate_non_overlap_state()
         model_worker_batch.spec_info_padded = next_draft_input

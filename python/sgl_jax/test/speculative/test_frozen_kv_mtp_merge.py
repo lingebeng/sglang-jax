@@ -85,12 +85,14 @@ def test_frozen_kv_merge_allows_prefill_without_accept_length_and_preserves_its_
         new_seq_lens=np.asarray([127], dtype=np.int32),
         accept_length_cpu=np.asarray([2], dtype=np.int32),
         relay_seed_mask=np.asarray([True]),
+        relay_proposal_mask=np.asarray([True]),
     )
     prefill = FrozenKvMtpDraftInput(
         future_indices=np.asarray([9], dtype=np.int32),
         allocate_lens=np.asarray([256], dtype=np.int32),
         new_seq_lens=np.asarray([255], dtype=np.int32),
         relay_seed_mask=np.asarray([True]),
+        relay_proposal_mask=np.asarray([False]),
     )
 
     running.merge_batch(prefill)
@@ -100,6 +102,7 @@ def test_frozen_kv_merge_allows_prefill_without_accept_length_and_preserves_its_
     np.testing.assert_array_equal(running.new_seq_lens, [127, 255])
     assert running.accept_length_cpu is None
     np.testing.assert_array_equal(running.relay_seed_mask, [True, True])
+    np.testing.assert_array_equal(running.relay_proposal_mask, [True, False])
 
 
 def test_frozen_kv_state_remains_a_jax_pytree_after_its_specialization():
@@ -242,9 +245,11 @@ def test_frozen_kv_relay_descriptor_trim_keeps_seed_mask_request_aligned():
         allocate_lens=np.asarray([128, 256, 384], dtype=np.int32),
         new_seq_lens=np.asarray([120, 240, 360], dtype=np.int32),
         relay_seed_mask=np.asarray([True, False, True]),
+        relay_proposal_mask=np.asarray([True, True, False]),
     )
 
     state.trim_to_length(2)
 
     np.testing.assert_array_equal(state.future_indices, [7, 11])
     np.testing.assert_array_equal(state.relay_seed_mask, [True, False])
+    np.testing.assert_array_equal(state.relay_proposal_mask, [True, True])

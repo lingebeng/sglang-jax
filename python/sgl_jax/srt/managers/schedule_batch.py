@@ -2858,6 +2858,10 @@ class ScheduleBatch:
             )
             if hasattr(flat, "relay_seed_mask"):
                 kwargs["relay_seed_mask"] = _scatter1(getattr(flat, "relay_seed_mask", None))
+            if hasattr(flat, "relay_proposal_mask"):
+                kwargs["relay_proposal_mask"] = _scatter1(
+                    getattr(flat, "relay_proposal_mask", None)
+                )
             return type(flat)(**kwargs)
 
         kwargs = dict(
@@ -2876,6 +2880,8 @@ class ScheduleBatch:
             # This is scheduler metadata, not a device model tensor. It keeps
             # each request's target-seed validity aligned through DP padding.
             kwargs["relay_seed_mask"] = _scatter1(getattr(flat, "relay_seed_mask", None))
+        if hasattr(flat, "relay_proposal_mask"):
+            kwargs["relay_proposal_mask"] = _scatter1(getattr(flat, "relay_proposal_mask", None))
         return type(flat)(**kwargs)
 
     @staticmethod
@@ -2995,6 +3001,11 @@ class ScheduleBatch:
             if hasattr(flat, "relay_seed_mask"):
                 value = getattr(flat, "relay_seed_mask", None)
                 kwargs["relay_seed_mask"] = None if value is None else np.asarray(value)[offset:end]
+            if hasattr(flat, "relay_proposal_mask"):
+                value = getattr(flat, "relay_proposal_mask", None)
+                kwargs["relay_proposal_mask"] = (
+                    None if value is None else np.asarray(value)[offset:end]
+                )
             out.append(type(flat)(**kwargs))
             offset += n
         return out
@@ -3107,6 +3118,17 @@ class ScheduleBatch:
                         "Frozen-KV relay_seed_mask must be present on every non-empty DP rank"
                     )
                 kwargs["relay_seed_mask"] = np.concatenate(
+                    [np.asarray(m, dtype=bool) for m in nonnull_masks], axis=0
+                )
+        if hasattr(nonempty[0], "relay_proposal_mask"):
+            proposal_masks = [getattr(s, "relay_proposal_mask", None) for s in nonempty]
+            nonnull_masks = [m for m in proposal_masks if m is not None]
+            if nonnull_masks:
+                if len(nonnull_masks) != len(nonempty):
+                    raise ValueError(
+                        "Frozen-KV relay_proposal_mask must be present on every non-empty DP rank"
+                    )
+                kwargs["relay_proposal_mask"] = np.concatenate(
                     [np.asarray(m, dtype=bool) for m in nonnull_masks], axis=0
                 )
         return type(nonempty[0])(**kwargs)

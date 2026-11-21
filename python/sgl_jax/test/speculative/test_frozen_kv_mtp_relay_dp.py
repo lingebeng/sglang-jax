@@ -313,4 +313,19 @@ def test_prefill_extension_only_publishes_seed_descriptor():
     np.testing.assert_array_equal(batch.spec_info_padded.allocate_lens, [10, 20])
     np.testing.assert_array_equal(batch.spec_info_padded.new_seq_lens, [10, 20])
     np.testing.assert_array_equal(batch.spec_info_padded.relay_seed_mask, [True, True])
+    np.testing.assert_array_equal(batch.spec_info_padded.relay_proposal_mask, [False, False])
     assert batch.return_hidden_states is False
+
+
+def test_prepared_proposal_gate_ignores_scheduler_padding_rows():
+    worker = FrozenKvMtpDraftWorker.__new__(FrozenKvMtpDraftWorker)
+    worker.proposal_relay_buffers = object()
+    batch = types.SimpleNamespace(
+        logits_indices_selector=np.asarray([0, 2], dtype=np.int32),
+        spec_info_padded=FrozenKvMtpDraftInput(
+            future_indices=np.asarray([4, 0, 7, 0], dtype=np.int32),
+            relay_proposal_mask=np.asarray([True, False, True, False]),
+        ),
+    )
+
+    assert worker._can_restore_prepared_proposal(batch) is True

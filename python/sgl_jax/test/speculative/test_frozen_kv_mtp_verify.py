@@ -139,6 +139,7 @@ def test_decode_precompile_uses_the_same_relay_descriptor_as_runtime():
     np.testing.assert_array_equal(descriptor["allocate_lens"], [16, 32])
     np.testing.assert_array_equal(descriptor["new_seq_lens"], [10, 20])
     np.testing.assert_array_equal(descriptor["relay_seed_mask"], [True, True])
+    np.testing.assert_array_equal(descriptor["relay_proposal_mask"], [False, False])
 
 
 class _FakeDraftWorker:
